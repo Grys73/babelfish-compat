@@ -1,8 +1,8 @@
 # babelfish-compat
 
 A Docker image of [Babelfish for PostgreSQL](https://babelfishpg.org/) 5.6.0, built from source, with a
-few small patches and settings that make it behave more like SQL Server for existing applications
-(ADO / OLE DB / SqlClient clients, bulk loads, computed columns, multilingual data).
+few small compatibility patches and settings for existing T-SQL applications (ADO / OLE DB /
+SqlClient clients, bulk loads, computed columns, multilingual data).
 
 This is a personal project by Krzysiek Niedziela. It is not part of the Babelfish project, and the
 patches have not been submitted upstream.

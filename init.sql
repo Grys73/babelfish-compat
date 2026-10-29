@@ -1,4 +1,4 @@
--- SQL Server compatibility functions, run once when the cluster is initialised (start.sh).
+-- Compatibility functions, run once when the cluster is initialised (start.sh).
 -- All T-SQL databases live in one Postgres database, so once is enough.
 
 -- Computed columns. Babelfish maps them to Postgres generated columns, which accept only IMMUTABLE

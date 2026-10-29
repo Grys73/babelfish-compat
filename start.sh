@@ -40,7 +40,7 @@ if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
 		shared_preload_libraries = 'babelfishpg_tds'
 		babelfishpg_tds.listen_addresses = '*'  
 		babelfishpg_tsql.migration_mode = '${MIGRATION_MODE}'
-		# SQL Server compatibility: default session language (language-default.patch),
+		# Compatibility: default session language (language-default.patch),
 		# REPEATABLE READ mapped to Postgres isolation, unsupported options ignored, not rejected
 		babelfishpg_tsql.language = '${LANGUAGE}'
 		babelfishpg_tsql.isolation_level_repeatable_read = 'pg_isolation'
@@ -97,7 +97,7 @@ if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
 	./psql -d ${DATABASE} \
 		-c "CALL SYS.INITIALIZE_BABELFISH('${USERNAME}');"
 
-	# SQL Server compatibility functions, see init.sql
+	# Compatibility functions, see init.sql
 	./psql -d ${DATABASE} -v ON_ERROR_STOP=1 -f /init.sql
 
 	./pg_ctl -D ${BABELFISH_DATA}/ stop
