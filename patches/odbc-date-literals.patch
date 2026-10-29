@@ -1,0 +1,88 @@
+babelfish-compat patch: see README
+--- a/contrib/babelfishpg_tsql/antlr/TSqlParser.g4
++++ b/contrib/babelfishpg_tsql/antlr/TSqlParser.g4
+@@ -2852,6 +2852,7 @@
+ 
+ execute_parameter
+     : constant   
++    | odbc_literal  // {ts '...'} / {d '...'}, as SQL Server accepts in a procedure call
+     | local_id (OUTPUT | OUT)?
+     | id
+     | DEFAULT    
+--- a/contrib/babelfishpg_tsql/src/tsqlIface.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlIface.cpp
+@@ -1046,6 +1046,17 @@
+ 		rewrite_function_trim_to_sys_trim(ctx);
+ 	}
+ 
++	/*
++	 * ODBC date literals {d 'yyyy-mm-dd'} and {ts 'yyyy-mm-dd hh:mi:ss[.fff]'} are datetime values in
++	 * the ODBC canonical format on SQL Server, whatever the session language: CONVERT style 121.
++	 */
++	void exitOdbc_literal(TSqlParser::Odbc_literalContext *ctx) override
++	{
++		if (ctx->op && (ctx->op->getType() == TSqlParser::D || ctx->op->getType() == TSqlParser::TS) && ctx->char_string())
++			rewritten_query_fragment.emplace(std::make_pair(ctx->start->getStartIndex(),
++				std::make_pair(::getFullText(ctx), "CONVERT(DATETIME, " + ::getFullText(ctx->char_string()) + ", 121)")));
++	}
++
+ 	void exitXml_func_arg(TSqlParser::Xml_func_argContext *ctx) override
+ 	{
+ 		if (ctx->EXIST() || ctx->VALUE())
+@@ -8615,6 +8626,20 @@
+ 	}
+ }
+ 
++/*
++ * sp_* parameters are taken as raw text, without the query rewrites: convert ODBC {d '...'} / {ts '...'}
++ * here like exitOdbc_literal does for expressions.
++ */
++static std::string
++execParamText(TSqlParser::Execute_parameterContext *exec_param)
++{
++	auto octx = exec_param->odbc_literal();
++
++	if (octx && octx->op && (octx->op->getType() == TSqlParser::D || octx->op->getType() == TSqlParser::TS) && octx->char_string())
++		return "CONVERT(DATETIME, " + ::getFullText(octx->char_string()) + ", 121)";
++	return ::getFullText(exec_param);
++}
++
+ static tsql_exec_param *
+ makeSpParam(TSqlParser::Execute_statement_arg_namedContext *ctx)
+ {
+@@ -8636,7 +8661,7 @@
+ 	}
+ 	else
+ 	{
+-		p->expr = makeTsqlExpr(exec_param, true);
++		p->expr = makeTsqlExpr(execParamText(exec_param), true);
+ 	}
+ 
+ 	return p;
+@@ -8662,7 +8687,7 @@
+ 	}
+ 	else
+ 	{
+-		p->expr = makeTsqlExpr(exec_param, true);
++		p->expr = makeTsqlExpr(execParamText(exec_param), true);
+ 	}
+ 
+ 	return p;
+--- a/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
+@@ -194,7 +194,14 @@
+ 		antlrcpp::Any visitPartition_function_call(TSqlParser::Partition_function_callContext *ctx) override;
+ 
+ 		antlrcpp::Any visitHierarchyid_static_method(TSqlParser::Hierarchyid_static_methodContext *ctx) override { handle(INSTR_UNSUPPORTED_TSQL_EXPRESSION_HIERARCHID, "hierarchid", getLineAndPos(ctx)); return visitChildren(ctx); }
+-		antlrcpp::Any visitOdbc_literal_expr(TSqlParser::Odbc_literal_exprContext *ctx) override { handle(INSTR_UNSUPPORTED_TSQL_EXPRESSION_ODBC_LITERAL, "odbc literal", getLineAndPos(ctx)); return visitChildren(ctx); }
++		antlrcpp::Any visitOdbc_literal_expr(TSqlParser::Odbc_literal_exprContext *ctx) override
++		{
++			/* {d '...'} and {ts '...'} are rewritten to CONVERT(DATETIME, '...', 121) in tsqlIface.cpp */
++			auto lit = ctx->odbc_literal();
++			if (!(lit->op && (lit->op->getType() == TSqlParser::D || lit->op->getType() == TSqlParser::TS) && lit->char_string()))
++				handle(INSTR_UNSUPPORTED_TSQL_EXPRESSION_ODBC_LITERAL, "odbc literal", getLineAndPos(ctx));
++			return visitChildren(ctx);
++		}
+ 		antlrcpp::Any visitDollar_action_expr(TSqlParser::Dollar_action_exprContext *ctx) override { handle(INSTR_UNSUPPORTED_TSQL_EXPRESSION_DOLLAR_ACTION, "$ACTION", getLineAndPos(ctx)); return visitChildren(ctx); }
+ 
+ 		antlrcpp::Any visitFunc_proc_name_schema(TSqlParser::Func_proc_name_schemaContext *ctx) override;

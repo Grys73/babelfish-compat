@@ -6,7 +6,7 @@ cd ${BABELFISH_HOME}/bin
 
 # Set default argument values
 USERNAME=babelfish_user
-PASSWORD=12345678
+PASSWORD=
 DATABASE=babelfish_db
 MIGRATION_MODE=single-db
 LANGUAGE=us_english
@@ -24,6 +24,11 @@ done
 
 # Initialize database cluster if it does not exist
 if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
+	# no default superuser password (the image listens on all addresses)
+	if [ -z "${PASSWORD}" ]; then
+		echo "start.sh: -p <password> is required on the first start" >&2
+		exit 1
+	fi
 	./initdb -D ${BABELFISH_DATA}/ -E "UTF8"
 	cat <<- EOF >> ${BABELFISH_DATA}/pg_hba.conf
 		# Allow all connections
@@ -57,11 +62,6 @@ if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
 		babelfishpg_tsql.escape_hatch_insert_bulk_options = 'ignore'
 		babelfishpg_tsql.escape_hatch_join_hints = 'ignore'
 		babelfishpg_tsql.escape_hatch_language_non_english = 'ignore'
-		babelfishpg_tsql.escape_hatch_login_hashed_password = 'ignore'
-		babelfishpg_tsql.escape_hatch_login_misc_options = 'ignore'
-		babelfishpg_tsql.escape_hatch_login_old_password = 'ignore'
-		babelfishpg_tsql.escape_hatch_login_password_must_change = 'ignore'
-		babelfishpg_tsql.escape_hatch_login_password_unlock = 'ignore'
 		babelfishpg_tsql.escape_hatch_nocheck_add_constraint = 'ignore'
 		babelfishpg_tsql.escape_hatch_nocheck_existing_constraint = 'ignore'
 		babelfishpg_tsql.escape_hatch_query_hints = 'ignore'
@@ -80,10 +80,13 @@ if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
 	EOF
 	./pg_ctl -D ${BABELFISH_DATA}/ start
 
-	# Set password for postgres
-	./psql -c "ALTER USER postgres WITH PASSWORD '${PASSWORD}';"
+	# Passwords as psql variables (:'pw' quotes them), so any character is safe
+	./psql -v ON_ERROR_STOP=1 -v pw="${PASSWORD}" -v usr="${USERNAME}" <<- 'EOSQL'
+		ALTER USER postgres WITH PASSWORD :'pw';
+		CREATE USER :"usr" WITH SUPERUSER CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
+	EOSQL
 
-	./psql -c "CREATE USER ${USERNAME} WITH SUPERUSER CREATEDB CREATEROLE PASSWORD '${PASSWORD}' INHERIT;" \
+	./psql \
 		-c "DROP DATABASE IF EXISTS ${DATABASE};" \
 		-c "CREATE DATABASE ${DATABASE} OWNER ${USERNAME};" \
 		-c "\c ${DATABASE}" \

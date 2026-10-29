@@ -1,0 +1,17 @@
+--- a/src/backend/utils/misc/queryenvironment.c
++++ b/src/backend/utils/misc/queryenvironment.c
+@@ -1252,6 +1252,14 @@
+ 				Assert(referenced_object_enr == depender_object_enr);
+ 				return referenced_object_enr;
+ 			}
++			/*
++			 * A default or check of a table variable may name a permanent type
++			 * (default '' on a column of a user-defined type casts to that type)
++			 * or collation. Keep it with the ENR like the column's own type.
++			 */
++			else if (entry->refclassid == TypeRelationId ||
++					 entry->refclassid == CollationRelationId)
++				return depender_object_enr;
+ 			else
+ 			{
+ 				ereport(ERROR,

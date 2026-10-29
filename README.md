@@ -28,7 +28,8 @@ docker build -t babelfish-compat .
 docker run -d --name bbf -p 1433:1433 -v bbfdata:/var/lib/babelfish/data babelfish-compat -u sa -p <password> -d babelfishdb -m multi-db
 ```
 
-`start.sh` flags: `-u` superuser, `-p` password (also set for `postgres`), `-d` the Babelfish
+`start.sh` flags: `-u` superuser, `-p` password (also set for `postgres`; required on the first start,
+there is no default), `-d` the Babelfish
 database, `-m` migration mode (`single-db` / `multi-db`), `-l` default session language (default
 `us_english`; any SQL Server language name or alias, e.g. `polski` / `Polish`). They only matter on
 the first start, when the data volume is empty.
@@ -38,9 +39,10 @@ The first start also writes into `postgresql.conf`:
 - `babelfishpg_tsql.language`: the default session language (needs `language-default.patch`).
 - `babelfishpg_tsql.isolation_level_repeatable_read = 'pg_isolation'`: `SET TRANSACTION ISOLATION
   LEVEL REPEATABLE READ` works instead of failing.
-- every `babelfishpg_tsql.escape_hatch_*` = `ignore`: unsupported options (`WITH NOCHECK`,
+- the `babelfishpg_tsql.escape_hatch_*` settings = `ignore`: unsupported options (`WITH NOCHECK`,
   `rowversion`, table hints, ...) are ignored instead of failing the statement. These cannot be set
-  with `ALTER SYSTEM`.
+  with `ALTER SYSTEM`. The `escape_hatch_login_*` ones stay `strict`, so login options Babelfish
+  cannot honour (hashed or old passwords, MUST_CHANGE, UNLOCK) fail instead of being dropped.
 
 and runs `init.sql` once (see below).
 
@@ -59,6 +61,12 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
 | `language-default.patch` | guc.c | A server default language (`babelfishpg_tsql.language` in `postgresql.conf` or `ALTER SYSTEM`) crashed backends on start and on a configuration reload: the assign hook sent the change to the client through the protocol plugin also where there is no request. Now only inside a transaction. A connection without a login language then gets the server default, as on SQL Server. |
 | `udt-arg-quote.patch` | hooks.c | Scalar functions with user-defined-type arguments failed to create in databases whose name needs quoting (e.g. starts with a digit): the schema name was put bare into a re-parsed GRANT list. |
 | `xml-strip-bom.patch` | PostgreSQL xml.c, tdstypeio.c | SQL Server never stores or returns a byte order mark in an `xml` value; Babelfish kept a leading U+FEFF. SqlClient sends every `xml` parameter and bulk value as UTF-16 with FF FE, so every .NET write stored one, and `XDocument.Parse` then failed on read. Stripped on input and on output (output also covers values stored earlier). |
+| `applock-per-database.patch` | applock.c | `sp_getapplock` locks belong to a database on SQL Server, but all Babelfish databases share one Postgres database, so two databases taking the same resource name blocked each other. The resource is now prefixed with the T-SQL database id. `@LockTimeout = 0` returns -1 when the lock is taken, as on SQL Server. |
+| `object-id-type.patch` | functions.c | `OBJECT_ID(name, 'U')` and `OBJECT_ID(name, 'V')` ignored the type and returned the id of any relation with that name. `'U'` now finds only tables and `'V'` only views. |
+| `odbc-date-literals.patch` | TSqlParser.g4, tsqlIface.cpp, tsqlUnsupportedFeatureHandler.cpp | ODBC escapes `{d 'yyyy-mm-dd'}` and `{ts 'yyyy-mm-dd hh:mi:ss[.fff]'}` are read as `datetime` in the ODBC canonical format (CONVERT style 121) whatever the session language, also in `sp_*` parameters. |
+| `select-lock-hints.patch` | tsqlIface.cpp | Lock hints in a SELECT (`HOLDLOCK` / `SERIALIZABLE` / `REPEATABLEREAD`, `UPDLOCK`, `XLOCK` / `TABLOCKX`, `NOWAIT`, `READPAST`) were dropped, so read-then-update code (numbering, upserts) ran without its lock and could produce duplicates. They become row locks (`FOR SHARE` / `FOR NO KEY UPDATE` / `FOR UPDATE OF`, `NOWAIT`, `SKIP LOCKED`), also inside procedures, triggers and functions created after the patch. PostgreSQL has no key-range locks, so rows inserted by other sessions are not blocked. Where Postgres accepts no locking clause (UNION, DISTINCT, GROUP BY, aggregates, window functions, SELECT INTO, FOR XML/JSON, outer joins) the hints stay ignored. |
+| `numeric-junk.patch` | PostgreSQL scan.l | Since PostgreSQL 15 a number glued to a word (`WHEN 111THEN`, `1.5AS`) is "trailing junk after numeric literal". SQL Server reads it as the number followed by the word; in T-SQL mode the scanner now does the same. PostgreSQL mode still rejects it. |
+| `enr-type-default.patch` | PostgreSQL queryenvironment.c | A table variable with a default or check on a column of a user-defined type (`declare @t table(c MyType not null default '')`) failed with "temporary objects cannot reference permanent non-system objects": the default casts to the type, and only the column itself was allowed to reference a permanent type. References to types and collations now stay with the table variable, like the column's type. |
 
 ## init.sql
 

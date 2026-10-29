@@ -1,0 +1,84 @@
+babelfish-compat patch: see README
+diff --git a/contrib/babelfishpg_tsql/src/applock.c b/contrib/babelfishpg_tsql/src/applock.c
+index 36e47bb..cc49235 100644
+--- a/contrib/babelfishpg_tsql/src/applock.c
++++ b/contrib/babelfishpg_tsql/src/applock.c
+@@ -14,6 +14,7 @@
+ #include "miscadmin.h"
+ #include "parser/parser.h"
+ #include "pltsql.h"
++#include "session.h"
+ #include "storage/lmgr.h"
+ #include "utils/builtins.h"
+ #include "utils/guc.h"
+@@ -34,7 +35,7 @@ static HTAB *appLockCacheLocal = NULL;
+ static HTAB *appLockCacheGlobal = NULL;
+ 
+ /* Max length of applock resource name string (including the ending '\0') */
+-#define APPLOCK_MAX_RESOURCE_LENGTH 256
++#define APPLOCK_MAX_RESOURCE_LENGTH (256 + 8)	/* + "<dbid>:" */
+ 
+ /* Max length of other relevant applock argument strings (including the ending '\0') */
+ #define APPLOCK_MAX_LOCKMODE_LENGTH 33
+@@ -166,6 +167,19 @@ ApplockPrintMessage(const char *fmt,...)
+ 	pfree(msg);
+ }
+ 
++/*
++ * Applocks belong to a database on SQL Server. All Babelfish databases share one
++ * Postgres database, so the resource name is prefixed with the T-SQL database id.
++ */
++static void
++ApplockQualifyResource(char *resource, size_t size)
++{
++	char		buf[APPLOCK_MAX_RESOURCE_LENGTH];
++
++	snprintf(buf, sizeof(buf), "%d:%s", (int) get_cur_db_id(), resource);
++	strlcpy(resource, buf, size);
++}
++
+ /* Helper macro to validate and get a string argument */
+ #define ApplockGetStringArg(argnum, OUT, len)		\
+     do {					\
+@@ -636,6 +650,9 @@ _sp_getapplock_internal(char *resource, char *lockmode,
+ 			get_timeout_finish_time(LOCK_TIMEOUT)
+ 			- start_time > (int64) timeout * 1e3 &&
+ 			geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE;
++		/* @LockTimeout = 0 (no wait): -1, as on SQL Server */
++		if (no_wait && geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE)
++			lock_timeout_occurred = true;
+ 
+ 		/* reset timeout back */
+ 		ApplockSetLockTimeout(cur_timeout);
+@@ -776,6 +793,7 @@ sp_getapplock_function(PG_FUNCTION_ARGS)
+ 		initApplockCache();
+ 
+ 	ApplockGetStringArg(0, resource, sizeof(resource));
++	ApplockQualifyResource(resource, sizeof(resource));
+ 	ApplockGetStringArg(1, lockmode, sizeof(lockmode));
+ 	ApplockGetStringArg(2, lockowner, sizeof(lockowner));
+ 	timeout = DatumGetInt32(PG_GETARG_DATUM(3));
+@@ -802,6 +820,7 @@ sp_releaseapplock_function(PG_FUNCTION_ARGS)
+ 		initApplockCache();
+ 
+ 	ApplockGetStringArg(0, resource, sizeof(resource));
++	ApplockQualifyResource(resource, sizeof(resource));
+ 	ApplockGetStringArg(1, lockowner, sizeof(lockowner));
+ 	ApplockGetStringArg(2, dbprincipal, sizeof(dbprincipal));
+ 
+@@ -838,6 +857,7 @@ APPLOCK_MODE(PG_FUNCTION_ARGS)
+ 		initApplockCache();
+ 
+ 	ApplockGetStringArg(1, resource, sizeof(resource));
++	ApplockQualifyResource(resource, sizeof(resource));
+ 
+ 	/* If we don't own the lock, just return NoLock */
+ 	if ((key = AppLockSearchKeyLocal(resource)) < 0)
+@@ -898,6 +918,7 @@ APPLOCK_TEST(PG_FUNCTION_ARGS)
+ 
+ 	ApplockGetStringArg(0, dbprincipal, sizeof(dbprincipal));
+ 	ApplockGetStringArg(1, resource, sizeof(resource));
++	ApplockQualifyResource(resource, sizeof(resource));
+ 	ApplockGetStringArg(2, lockmode, sizeof(lockmode));
+ 	ApplockGetStringArg(3, lockowner, sizeof(lockowner));
+ 

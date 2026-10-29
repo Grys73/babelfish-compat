@@ -1,0 +1,73 @@
+diff -ru a/src/backend/parser/scan.l b/src/backend/parser/scan.l
+--- a/src/backend/parser/scan.l	2026-10-29 18:06:07.780201300 +0100
++++ b/src/backend/parser/scan.l	2026-10-29 18:06:17.023224400 +0100
+@@ -131,6 +131,7 @@
+ static char *litbufdup(core_yyscan_t yyscanner);
+ static unsigned char unescape_single_char(unsigned char c, core_yyscan_t yyscanner);
+ static int	process_integer_literal(const char *token, YYSTYPE *lval, int base);
++static int	tsql_number_prefix(const char *text);
+ static void addunicode(pg_wchar c, yyscan_t yyscanner);
+ 
+ #define yyerror(msg)  scanner_yyerror(msg, yyscanner)
+@@ -1108,14 +1109,34 @@
+ 				}
+ {integer_junk}	{
+ 					SET_YYLLOC();
++					/* babelfish-compat patch: numeric-junk, T-SQL reads 111THEN as 111 THEN */
++					if (sql_dialect == SQL_DIALECT_TSQL)
++					{
++						yyless(tsql_number_prefix(yytext));
++						return process_integer_literal(yytext, yylval, 10);
++					}
+ 					yyerror("trailing junk after numeric literal");
+ 				}
+ {numeric_junk}	{
+ 					SET_YYLLOC();
++					/* babelfish-compat patch: numeric-junk, T-SQL reads 111THEN as 111 THEN */
++					if (sql_dialect == SQL_DIALECT_TSQL)
++					{
++						yyless(tsql_number_prefix(yytext));
++						yylval->str = pstrdup(yytext);
++						return FCONST;
++					}
+ 					yyerror("trailing junk after numeric literal");
+ 				}
+ {real_junk}		{
+ 					SET_YYLLOC();
++					/* babelfish-compat patch: numeric-junk, T-SQL reads 111THEN as 111 THEN */
++					if (sql_dialect == SQL_DIALECT_TSQL)
++					{
++						yyless(tsql_number_prefix(yytext));
++						yylval->str = pstrdup(yytext);
++						return FCONST;
++					}
+ 					yyerror("trailing junk after numeric literal");
+ 				}
+ 
+@@ -1552,3 +1573,26 @@
+ 	if (ptr)
+ 		pfree(ptr);
+ }
++
++/*
++ * babelfish-compat patch: numeric-junk. Length of the number at the start of a
++ * "trailing junk" token (digits, a decimal point, an exponent), so T-SQL can
++ * take 111THEN or 1.5AS as a number followed by a word, as SQL Server does.
++ */
++static int
++tsql_number_prefix(const char *text)
++{
++	int			n = 0;
++
++	while (isdigit((unsigned char) text[n]) || text[n] == '.')
++		n++;
++	if ((text[n] == 'e' || text[n] == 'E') &&
++		(isdigit((unsigned char) text[n + 1]) ||
++		 ((text[n + 1] == '+' || text[n + 1] == '-') && isdigit((unsigned char) text[n + 2]))))
++	{
++		n += (text[n + 1] == '+' || text[n + 1] == '-') ? 2 : 1;
++		while (isdigit((unsigned char) text[n]))
++			n++;
++	}
++	return n;
++}

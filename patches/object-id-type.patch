@@ -1,0 +1,25 @@
+babelfish-compat patch: see README
+diff --git a/contrib/babelfishpg_tsql/runtime/functions.c b/contrib/babelfishpg_tsql/runtime/functions.c
+index 3391a16..0c5ce94 100644
+--- a/contrib/babelfishpg_tsql/runtime/functions.c
++++ b/contrib/babelfishpg_tsql/runtime/functions.c
+@@ -2670,8 +2670,18 @@ object_id(PG_FUNCTION_ARGS)
+ 			{
+ 				/* search in pg_class by name and schema oid */
+ 				Oid			relid = get_relname_relid((const char *) object_name, schema_oid);
++				char		relkind = OidIsValid(relid) ? get_rel_relkind(relid) : '\0';
++				bool		kind_ok;
++
++				/* 'U' is a table and 'V' a view only, as on SQL Server */
++				if (!strcmp(object_type, "u"))
++					kind_ok = relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE;
++				else if (!strcmp(object_type, "v"))
++					kind_ok = relkind == RELKIND_VIEW || relkind == RELKIND_MATVIEW;
++				else
++					kind_ok = relkind != RELKIND_INDEX;
+ 
+-				if (OidIsValid(relid) && get_rel_relkind(relid) != RELKIND_INDEX && pg_class_aclcheck(relid, user_id, ACL_SELECT) == ACLCHECK_OK)
++				if (OidIsValid(relid) && kind_ok && pg_class_aclcheck(relid, user_id, ACL_SELECT) == ACLCHECK_OK)
+ 				{
+ 					result = relid;
+ 				}

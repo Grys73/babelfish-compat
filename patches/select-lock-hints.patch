@@ -1,0 +1,171 @@
+babelfish-compat patch: see README
+--- a/contrib/babelfishpg_tsql/src/tsqlIface.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlIface.cpp
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <functional>
+ #include <iostream>
++#include <regex>
+ #include <strstream>
+ #include <string>
+ #include <string_view>
+@@ -181,6 +182,10 @@
+ static bool is_quotation_needed_for_column_alias(TSqlParser::Column_aliasContext *ctx);
+ static bool is_compiling_create_function();
+ static void process_query_specification(TSqlParser::Query_specificationContext *qctx, PLtsql_expr_query_mutator *mutator, bool process_local_id_assignment);
++static void add_row_locks_for_lock_hints(TSqlParser::Query_specificationContext *qctx, PLtsql_expr_query_mutator *mutator);
++static int lock_hint_strength(TSqlParser::With_table_hintsContext *wctx, std::string &wait);
++/* CREATE PROCEDURE/TRIGGER/FUNCTION: keep lock hints in the stored body for add_row_locks_for_lock_hints */
++static bool keep_lock_hints = false;
+ static void process_select_statement(TSqlParser::Select_statementContext *selectCtx, PLtsql_expr_query_mutator *mutator);
+ static void process_select_statement_standalone(TSqlParser::Select_statement_standaloneContext *standaloneCtx, PLtsql_expr_query_mutator *mutator, tsqlBuilder &builder);
+ template <class T> static std::string rewrite_object_name_with_omitted_db_and_schema_name(T ctx, GetCtxFunc<T> getDatabase, GetCtxFunc<T> getSchema, GetCtxFunc<T> getObject);
+@@ -2927,7 +2932,10 @@
+ 		}
+ 		has_identity_function = false;
+ 		if (statementMutator)
++		{
+ 			process_query_specification(ctx, statementMutator.get(), true);
++			add_row_locks_for_lock_hints(ctx, statementMutator.get());
++		}
+ 	}
+ 
+ 	void exitDrop_relational_or_xml_or_spatial_index(TSqlParser::Drop_relational_or_xml_or_spatial_indexContext *ctx) override
+@@ -4187,6 +4195,14 @@
+ {
+ 	// rewrite batch-level stmt query
+ 	PLtsql_expr_query_mutator mutator(expr, ctx);
++
++	/* bodies parsed again at run time keep their lock hints (add_row_locks_for_lock_hints) */
++	struct KeepLockHints
++	{
++		KeepLockHints(bool on) { keep_lock_hints = on; }
++		~KeepLockHints() { keep_lock_hints = false; }
++	} keep(ctx->create_or_alter_procedure() || ctx->create_or_alter_trigger() ||
++		   (ctx->create_or_alter_function() && !ctx->create_or_alter_function()->func_body_returns_select()));
+ 	/* cppcheck-suppress autoVariables */
+ 	ssm->mutator = &mutator;
+ 
+@@ -7593,11 +7609,13 @@
+ 
+ 	std::string table_name = extractTableName(nullptr, ctx);
+ 
++	std::string unused_wait;
+ 	for (auto wctx : ctx->with_table_hints())
+ 	{
+ 		if (!wctx->sample_clause())
+ 			extractTableHints(wctx, table_name);
+-		removeCtxStringFromQuery(expr, wctx, baseCtx);
++		if (!keep_lock_hints || !lock_hint_strength(wctx, unused_wait))
++			removeCtxStringFromQuery(expr, wctx, baseCtx);
+ 	}
+ 
+ 	for (auto actx : ctx->as_table_alias())
+@@ -7612,7 +7630,8 @@
+ 		{
+ 			if (!actx->table_alias()->with_table_hints()->sample_clause())
+ 				extractTableHints(actx->table_alias()->with_table_hints(), alias_name);
+-			removeCtxStringFromQuery(expr, actx->table_alias()->with_table_hints(), baseCtx);
++			if (!keep_lock_hints || !lock_hint_strength(actx->table_alias()->with_table_hints(), unused_wait))
++				removeCtxStringFromQuery(expr, actx->table_alias()->with_table_hints(), baseCtx);
+ 		}
+ 	}
+ 
+@@ -7654,6 +7673,97 @@
+ 	}
+ }
+ 
++/*
++ * Lock hints on a table in a SELECT (HOLDLOCK / SERIALIZABLE / REPEATABLEREAD, UPDLOCK, XLOCK / TABLOCKX)
++ * are removed with the other hints, so read-then-update code (document numbering, upserts) ran without its
++ * lock and could produce duplicates. Keep them as row locks: FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE
++ * OF <table or alias>, NOWAIT as NOWAIT and READPAST as SKIP LOCKED. PostgreSQL has no key-range locks, so
++ * rows other sessions insert are not blocked. Only where PostgreSQL accepts a locking clause: no UNION,
++ * DISTINCT, GROUP BY, HAVING, aggregates, window functions, SELECT INTO, FOR XML/JSON or outer joins;
++ * elsewhere the hints stay ignored as before.
++ */
++static int
++lock_hint_strength(TSqlParser::With_table_hintsContext *wctx, std::string &wait)
++{
++	int			strength = 0;	/* 1 share, 2 no key update, 3 update */
++
++	if (!wctx || wctx->sample_clause())
++		return 0;
++	for (auto hint : wctx->table_hint())
++	{
++		if (hint->HOLDLOCK() || hint->SERIALIZABLE() || hint->REPEATABLEREAD())
++			strength = std::max(strength, 1);
++		else if (hint->UPDLOCK())
++			strength = std::max(strength, 2);
++		else if (hint->XLOCK() || hint->TABLOCKX())
++			strength = std::max(strength, 3);
++		else if (hint->NOWAIT())
++			wait = " NOWAIT";
++		else if (hint->READPAST())
++			wait = " SKIP LOCKED";
++	}
++	return strength;
++}
++
++static void
++collect_lock_hints(TSqlParser::Table_source_itemContext *ctx, std::string &clauses, bool &unsupported)
++{
++	for (auto cctx : ctx->table_source_item())
++		collect_lock_hints(cctx, clauses, unsupported);
++
++	if (ctx->oj || ctx->lj)		/* the nullable side of an outer join cannot be locked */
++		unsupported = true;
++	if (!ctx->full_object_name())
++		return;
++
++	std::string name = ::getFullText(ctx->full_object_name()->object_name);
++	std::string wait;
++	int			strength = 0;
++
++	for (auto wctx : ctx->with_table_hints())
++		strength = std::max(strength, lock_hint_strength(wctx, wait));
++	for (auto actx : ctx->as_table_alias())
++	{
++		if (actx == ctx->as_table_alias().front())
++			name = ::getFullText(actx->table_alias()->id());
++		strength = std::max(strength, lock_hint_strength(actx->table_alias()->with_table_hints(), wait));
++	}
++	if (strength)
++		clauses += std::string(strength == 1 ? " FOR SHARE" : strength == 2 ? " FOR NO KEY UPDATE" : " FOR UPDATE") + " OF " + name + wait;
++}
++
++static void
++add_row_locks_for_lock_hints(TSqlParser::Query_specificationContext *qctx, PLtsql_expr_query_mutator *mutator)
++{
++	static const std::regex aggregate(R"(\b(count|count_big|sum|min|max|avg|stdevp?|varp?|string_agg|checksum_agg|grouping|grouping_id|approx_count_distinct|over)\s*\()",
++									  std::regex::icase);
++	std::string clauses;
++	bool		unsupported = false;
++
++	if (!qctx->table_sources() || qctx->DISTINCT() || qctx->INTO() || qctx->GROUP() || qctx->HAVING())
++		return;
++	for (auto tctx : qctx->table_sources()->table_source_item())
++		collect_lock_hints(tctx, clauses, unsupported);
++	static const std::regex outer_join(R"(\b(left|right|full)\s+(outer\s+)?join\b|\bouter\s+apply\b)", std::regex::icase);
++	if (clauses.empty() || unsupported || std::regex_search(::getFullText(qctx->select_list()), aggregate) ||
++		std::regex_search(::getFullText(qctx->table_sources()), outer_join))
++		return;
++
++	auto qe = dynamic_cast<TSqlParser::Query_expressionContext *>(qctx->parent);
++	if (!qe || qe->query_specification() != qctx || !qe->sql_union().empty())
++		return;
++	auto ss = dynamic_cast<TSqlParser::Select_statementContext *>(qe->parent);
++	if (!ss || ss->for_clause())
++		return;
++	for (auto pctx = ss->parent; pctx; pctx = pctx->parent)
++		if (dynamic_cast<TSqlParser::Declare_cursorContext *>(pctx))
++			return;
++
++	/* after ORDER BY, before OPTION */
++	antlr4::Token *last = ss->order_by_clause() ? ss->order_by_clause()->stop : qe->stop;
++	mutator->add(last->getStopIndex() + 1, "", clauses);
++}
++
+ void process_execsql_remove_unsupported_tokens(TSqlParser::Dml_statementContext *ctx, PLtsql_expr_query_mutator *exprMutator)
+ {
+ 	PLtsql_expr * sqlstmt = exprMutator->expr;
