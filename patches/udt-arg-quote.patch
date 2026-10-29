@@ -1,0 +1,41 @@
+diff -ru a/contrib/babelfishpg_tsql/src/hooks.c b/contrib/babelfishpg_tsql/src/hooks.c
+--- a/contrib/babelfishpg_tsql/src/hooks.c	2026-10-28 23:17:25.238157700 +0100
++++ b/contrib/babelfishpg_tsql/src/hooks.c	2026-10-28 23:17:42.914512100 +0100
+@@ -3737,6 +3737,20 @@
+ 	/* Command Counter will be increased by validator */
+ }
+ 
++static void
++append_bracketed_if_needed(StringInfo buf, const char *name)
++{
++	/* plain lowercase identifiers (keywords too, e.g. pg_catalog.time) stay bare */
++	bool		plain = (name[0] >= 'a' && name[0] <= 'z') || name[0] == '_';
++
++	for (const char *c = name; plain && *c; c++)
++		plain = (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '$';
++	if (plain)
++		appendStringInfoString(buf, name);
++	else
++		appendStringInfo(buf, "[%s]", name);
++}
++
+ char *
+ gen_func_arg_list(Oid objectId)
+ {
+@@ -3764,9 +3778,14 @@
+ 		nsp_name = get_namespace_name(((Form_pg_type) GETSTRUCT(typeTuple))->typnamespace);
+ 		ReleaseSysCache(typeTuple);
+ 
+-		appendStringInfoString(&arg_list, nsp_name);
++		/*
++		 * The list is parsed again (REVOKE ... FROM PUBLIC, GRANT): a schema of a
++		 * database whose name needs quoting (e.g. 2024-sales_dbo) is a syntax error
++		 * bare. Bracket only such names, so every other list stays as it was.
++		 */
++		append_bracketed_if_needed(&arg_list, nsp_name);
+ 		appendStringInfoString(&arg_list, ".");
+-		appendStringInfoString(&arg_list, type_name);
++		append_bracketed_if_needed(&arg_list, type_name);
+ 		if (i < nargs - 1)
+ 			appendStringInfoString(&arg_list, ", ");
+ 	}

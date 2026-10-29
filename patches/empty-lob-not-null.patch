@@ -1,0 +1,21 @@
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdsbulkload.c	2026-10-28 20:23:42.325307100 +0100
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdsbulkload.c	2026-10-28 20:23:50.483738500 +0100
+@@ -794,13 +794,12 @@
+ 						memcpy(&len, &message->data[bcpOffset], sizeof(uint32_t));
+ 						bcpOffset += sizeof(uint32_t);
+ 						request->currentBatchSize += sizeof(uint32_t);
+-						if (len == 0)	/* null */
+-						{
+-							rowData->isNull[i] = true;
+-							i++;
+-							continue;
+-						}
+ 
++						/*
++						 * NULL was already signalled by a zero-length text pointer above;
++						 * a value with len == 0 is an empty string/binary, not NULL.
++						 * (babelfish-compat patch: empty-lob-not-null)
++						 */
+ 						CheckForInvalidLength(len, request, i);
+ 
+ 						CheckMessageHasEnoughBytesToReadRows(&message, len);

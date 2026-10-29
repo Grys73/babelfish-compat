@@ -1,0 +1,93 @@
+diff -ruN a/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c b/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c	2026-10-29 10:45:48.420052600 +0100
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c	2026-10-29 10:47:07.239833800 +0100
+@@ -1397,6 +1397,16 @@
+ 	doc = tds_xml_parse(result, XMLOPTION_CONTENT, true, encoding);
+ 	tds_xmlFreeDoc(doc);
+ 
++	/*
++	 * SQL Server drops the byte order mark; clients send one (SqlClient
++	 * sends xml as UTF-16 with FF FE), which arrives here as UTF-8 EF BB BF.
++	 * (babelfish-compat patch: xml-strip-bom)
++	 */
++	if (VARSIZE_ANY_EXHDR(result) >= 3 &&
++		memcmp(VARDATA_ANY(result), "\xEF\xBB\xBF", 3) == 0)
++		result = cstring_to_text_with_len((char *) VARDATA_ANY(result) + 3,
++										  VARSIZE_ANY_EXHDR(result) - 3);
++
+ 	PG_RETURN_XML_P(result);
+ }
+ 
+diff -ruN a/src/backend/utils/adt/xml.c b/src/backend/utils/adt/xml.c
+--- a/src/backend/utils/adt/xml.c	2026-10-29 10:45:48.398711000 +0100
++++ b/src/backend/utils/adt/xml.c	2026-10-29 10:47:07.232731700 +0100
+@@ -273,6 +273,24 @@
+  * This is only acceptable so long as xmltype and text use the same
+  * representation.
+  */
++/*
++ * T-SQL compatibility (babelfish-compat patch: xml-strip-bom): SQL Server
++ * never stores or returns a byte order mark in an xml value, but clients
++ * send one (SqlClient sends xml as UTF-16 with FF FE).  Drop a leading
++ * UTF-8 BOM on input and on output.
++ */
++#define XML_UTF8_BOM "\xEF\xBB\xBF"
++#define XML_HAS_BOM(p, n) ((n) >= 3 && memcmp((p), XML_UTF8_BOM, 3) == 0)
++
++static text *
++xml_strip_bom(text *t)
++{
++	if (XML_HAS_BOM(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t)))
++		return cstring_to_text_with_len(VARDATA_ANY(t) + 3,
++										VARSIZE_ANY_EXHDR(t) - 3);
++	return t;
++}
++
+ Datum
+ xml_in(PG_FUNCTION_ARGS)
+ {
+@@ -281,6 +299,9 @@
+ 	xmltype    *vardata;
+ 	xmlDocPtr	doc;
+ 
++	if (XML_HAS_BOM(s, strlen(s)))
++		s += 3;
++
+ 	/* Build the result object. */
+ 	vardata = (xmltype *) cstring_to_text(s);
+ 
+@@ -318,11 +339,15 @@
+ 	char	   *str = text_to_cstring((text *) x);
+ 
+ #ifdef USE_LIBXML
+-	size_t		len = strlen(str);
++	size_t		len;
+ 	xmlChar    *version;
+ 	int			standalone;
+ 	int			res_code;
+ 
++	if (XML_HAS_BOM(str, strlen(str)))
++		memmove(str, str + 3, strlen(str + 3) + 1);
++	len = strlen(str);
++
+ 	if ((res_code = parse_xml_decl((xmlChar *) str,
+ 								   &len, &version, NULL, &standalone)) == 0)
+ 	{
+@@ -430,7 +455,7 @@
+ 		pfree(newstr);
+ 	}
+ 
+-	PG_RETURN_XML_P(result);
++	PG_RETURN_XML_P((xmltype *) xml_strip_bom((text *) result));
+ #else
+ 	NO_XML_SUPPORT();
+ 	return 0;
+@@ -1003,7 +1028,7 @@
+ 					GetDatabaseEncoding(), NULL, NULL, NULL);
+ 	xmlFreeDoc(doc);
+ 
+-	return (xmltype *) data;
++	return (xmltype *) xml_strip_bom(data);
+ #else
+ 	NO_XML_SUPPORT();
+ 	return NULL;

@@ -1,0 +1,27 @@
+diff -ruN a/contrib/babelfishpg_tsql/src/guc.c b/contrib/babelfishpg_tsql/src/guc.c
+--- a/contrib/babelfishpg_tsql/src/guc.c	2026-10-29 11:04:01.405618700 +0100
++++ b/contrib/babelfishpg_tsql/src/guc.c	2026-10-29 11:04:01.728722100 +0100
+@@ -11,6 +11,7 @@
+ #include "pl_explain.h"
+ #include "miscadmin.h"
+ #include "access/parallel.h"
++#include "access/xact.h"
+ 
+ #define PLTSQL_SESSION_ISOLATION_LEVEL "default_transaction_isolation"
+ #define PLTSQL_TRANSACTION_ISOLATION_LEVEL "transaction_isolation"
+@@ -557,7 +558,14 @@
+ static void
+ assign_language(const char *newval, void *extra)
+ {
+-	if (pltsql_language != NULL)
++	/*
++	 * babelfish-compat patch: language-default. Tell the client only inside a
++	 * request: a server default (babelfishpg_tsql.language in postgresql.conf)
++	 * is also assigned in the postmaster and on a configuration reload, where
++	 * there is no protocol plugin or client, and that crashed the backend.
++	 */
++	if (pltsql_language != NULL && IsTransactionState() &&
++		pltsql_protocol_plugin_ptr && *pltsql_protocol_plugin_ptr)
+ 	{
+ 		char		mbuf[1024];
+ 

@@ -1,0 +1,99 @@
+diff -ru a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y	2026-10-28 22:21:54.485919000 +0100
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y	2026-10-28 22:21:54.502927000 +0100
+@@ -4615,6 +4615,18 @@
+ 					n->is_local = false;
+ 					$$ = (Node *) n;
+ 				}
++			/* babelfish-compat patch: session-language, SET LANGUAGE N'name' */
++			| SET LANGUAGE TSQL_NVARCHAR Sconst
++				{
++					VariableSetStmt *n = makeNode(VariableSetStmt);
++					TSQLInstrumentation(INSTR_TSQL_OPTION_LANGUAGE);
++
++					n->name = psprintf("babelfishpg_tsql.%s", $2);
++
++					n->args = list_make1(makeStringConst($4, @4));
++					n->is_local = false;
++					$$ = (Node *) n;
++				}
+ 			| SET tsql_TranKeyword tsql_IsolationLevel
+ 				{
+ 					VariableSetStmt *n = makeNode(VariableSetStmt);
+diff -ru a/contrib/babelfishpg_tsql/src/guc.c b/contrib/babelfishpg_tsql/src/guc.c
+--- a/contrib/babelfishpg_tsql/src/guc.c	2026-10-28 22:21:54.478691400 +0100
++++ b/contrib/babelfishpg_tsql/src/guc.c	2026-10-28 22:21:54.484917600 +0100
+@@ -294,9 +294,73 @@
+ 	return true;
+ }
+ 
++/*
++ * babelfish-compat patch: session-language. SQL Server languages (sys.syslanguages
++ * of SQL Server, in langid order) are kept as the session language, by name or
++ * alias, stored as the name like SQL Server's @@language. Dates and messages stay
++ * us_english; only the setting itself is kept, so applications that pick data by
++ * language (sys.langid() from init.sql) see it. Login language and SET LANGUAGE
++ * both come here, and a connection reset restores the login one.
++ */
++static const struct
++{
++	const char *name;
++	const char *alias;
++}			sqlserver_languages[] = {
++	{"us_english", "English"},
++	{"Deutsch", "German"},
++	{"Français", "French"},
++	{"日本語", "Japanese"},
++	{"Dansk", "Danish"},
++	{"Español", "Spanish"},
++	{"Italiano", "Italian"},
++	{"Nederlands", "Dutch"},
++	{"Norsk", "Norwegian"},
++	{"Português", "Portuguese"},
++	{"Suomi", "Finnish"},
++	{"Svenska", "Swedish"},
++	{"čeština", "Czech"},
++	{"magyar", "Hungarian"},
++	{"polski", "Polish"},
++	{"română", "Romanian"},
++	{"hrvatski", "Croatian"},
++	{"slovenčina", "Slovak"},
++	{"slovenski", "Slovenian"},
++	{"ελληνικά", "Greek"},
++	{"български", "Bulgarian"},
++	{"русский", "Russian"},
++	{"Türkçe", "Turkish"},
++	{"British", "British English"},
++	{"eesti", "Estonian"},
++	{"latviešu", "Latvian"},
++	{"lietuvių", "Lithuanian"},
++	{"Português (Brasil)", "Brazilian"},
++	{"繁體中文", "Traditional Chinese"},
++	{"한국어", "Korean"},
++	{"简体中文", "Simplified Chinese"},
++	{"Arabic", "Arabic"},
++	{"ไทย", "Thai"},
++	{"norsk (bokmål)", "Bokmål"},
++};
++
+ static bool
+ check_language(char **newval, void **extra, GucSource source)
+ {
++	for (int i = 0; i < lengthof(sqlserver_languages); i++)
++	{
++		if (pg_strcasecmp(*newval, sqlserver_languages[i].name) == 0 ||
++			pg_strcasecmp(*newval, sqlserver_languages[i].alias) == 0)
++		{
++			char	   *canonical = guc_strdup(LOG, sqlserver_languages[i].name);
++
++			if (canonical == NULL)
++				return false;
++			guc_free(*newval);
++			*newval = canonical;
++			return true;
++		}
++	}
++
+ 	/* We will only allow "us_english" for now */
+ 	if (strcmp(*newval, PLTSQL_DEFAULT_LANGUAGE) != 0 && escape_hatch_session_settings != EH_IGNORE)
+ 		ereport(ERROR,
