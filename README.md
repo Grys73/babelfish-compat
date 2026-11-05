@@ -84,8 +84,8 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
   locks the target rows MERGE matches but has no key-range locks, so two concurrent upserts of the same new key
   end in a unique-key violation (or a duplicate row, if the key has no unique index) instead of one waiting for
   the other. Keep a unique index on the MERGE key and retry on the error.
-- Semantics are PostgreSQL's MERGE (join, `WHEN NOT MATCHED BY SOURCE`, a target row matched twice is an error,
-  as on SQL Server).
+- MERGE runs with PostgreSQL 17 semantics. `WHEN NOT MATCHED BY SOURCE` is supported, and a target row matched
+  twice is an error, as on SQL Server.
 
 ## init.sql
 
@@ -159,9 +159,10 @@ added in this update (`tsql-merge`, `sp-helptext`, `insert-exec-batch`, `compute
 - The first run found two regressions, both fixed before publishing: a schema-qualified MERGE target or
   source outside `master` was not mapped to the database's schema, and `computed-default` converted every
   column-free volatile expression (now limited to the current date/time functions).
-- Application checks: MERGE upserts (with HOLDLOCK, on views with INSTEAD OF triggers, cross-database), EF Core
-  batched inserts through MERGE ... OUTPUT INTO, EF Core migrations on an empty database (DropColumn,
-  RenameTable / RenameIndex, computed GETDATE columns), `sp_helptext`, `sp_MSforeachdb` under INSERT EXEC.
+- Application checks, on the final build: MERGE upserts (with HOLDLOCK, on views with INSTEAD OF triggers,
+  cross-database), EF Core batched inserts through MERGE ... OUTPUT INTO, a real application's 80 EF Core
+  migrations on an empty database with the stock SQL Server provider (DropColumn, RenameTable / RenameIndex,
+  computed GETDATE columns), `sp_helptext`, `sp_MSforeachdb` under INSERT EXEC.
 
 ## Licence
 
