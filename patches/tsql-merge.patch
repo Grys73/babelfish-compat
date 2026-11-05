@@ -1,0 +1,465 @@
+--- a/contrib/babelfishpg_tsql/src/backend_parser/kwlist.h
++++ b/contrib/babelfishpg_tsql/src/backend_parser/kwlist.h
+@@ -273,10 +273,13 @@
+ PG_KEYWORD("m", TSQL_M, UNRESERVED_KEYWORD)
+ PG_KEYWORD("mapping", MAPPING, UNRESERVED_KEYWORD)
+ PG_KEYWORD("match", MATCH, UNRESERVED_KEYWORD)
++PG_KEYWORD("matched", MATCHED, UNRESERVED_KEYWORD)
+ PG_KEYWORD("materialized", MATERIALIZED, UNRESERVED_KEYWORD)
+ PG_KEYWORD("maxvalue", MAXVALUE, UNRESERVED_KEYWORD)
+ PG_KEYWORD("mcs", TSQL_MCS, UNRESERVED_KEYWORD)
+ PG_KEYWORD("member", TSQL_MEMBER, UNRESERVED_KEYWORD)
++PG_KEYWORD("merge", MERGE, UNRESERVED_KEYWORD)
++PG_KEYWORD("merge_action", MERGE_ACTION, COL_NAME_KEYWORD)
+ PG_KEYWORD("method", METHOD, UNRESERVED_KEYWORD)
+ PG_KEYWORD("mi", TSQL_MI, UNRESERVED_KEYWORD)
+ PG_KEYWORD("microsecond", TSQL_MICROSECOND, UNRESERVED_KEYWORD)
+@@ -448,6 +451,7 @@
+ PG_KEYWORD("smallint", SMALLINT, COL_NAME_KEYWORD)
+ PG_KEYWORD("snapshot", SNAPSHOT, UNRESERVED_KEYWORD)
+ PG_KEYWORD("some", SOME, RESERVED_KEYWORD)
++PG_KEYWORD("source", SOURCE, UNRESERVED_KEYWORD)
+ PG_KEYWORD("sql", SQL_P, UNRESERVED_KEYWORD)
+ PG_KEYWORD("ss", TSQL_SS, UNRESERVED_KEYWORD)
+ PG_KEYWORD("stable", STABLE, UNRESERVED_KEYWORD)
+@@ -473,6 +477,7 @@
+ PG_KEYWORD("tablespace", TABLESPACE, UNRESERVED_KEYWORD)
+ PG_KEYWORD("tablock", TSQL_TABLOCK, UNRESERVED_KEYWORD)
+ PG_KEYWORD("tablockx", TSQL_TABLOCKX, UNRESERVED_KEYWORD)
++PG_KEYWORD("target", TARGET, UNRESERVED_KEYWORD)
+ PG_KEYWORD("temp", TEMP, UNRESERVED_KEYWORD)
+ PG_KEYWORD("template", TEMPLATE, UNRESERVED_KEYWORD)
+ PG_KEYWORD("temporary", TEMPORARY, UNRESERVED_KEYWORD)
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y
+@@ -2502,6 +2502,30 @@
+ 			
+ 		;
+ 
++/*
++ * MERGE (tsql-merge patch): in T-SQL mode the scanner returns TSQL_VALUES for VALUES, so the
++ * INSERT action of PostgreSQL's MERGE rule never matched. Same actions as merge_values_clause
++ * and INSERT DEFAULT VALUES in gram.y.
++ */
++merge_values_clause:
++			TSQL_VALUES '(' expr_list ')'
++				{
++					$$ = $3;
++				}
++		;
++
++merge_insert:
++			INSERT DEFAULT TSQL_VALUES
++				{
++					MergeWhenClause *n = makeNode(MergeWhenClause);
++					n->commandType = CMD_INSERT;
++					n->override = OVERRIDING_NOT_SET;
++					n->targetList = NIL;
++					n->values = NIL;
++					$$ = n;
++				}
++		;
++
+ tsql_values_clause:
+ 			TSQL_VALUES '(' expr_list ')'
+ 				{
+@@ -2724,6 +2748,7 @@
+ 			| RefreshMatViewStmt
+ 			| LoadStmt
+ 			| LockStmt
++			| MergeStmt
+ 			| NotifyStmt
+ 			| PrepareStmt
+ 			| ReassignOwnedStmt
+--- a/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
+@@ -130,7 +130,8 @@
+ 		antlrcpp::Any visitUpdate_statement(TSqlParser::Update_statementContext *ctx) override;
+ 		antlrcpp::Any visitDelete_statement(TSqlParser::Delete_statementContext *ctx) override;
+ 		antlrcpp::Any visitDelete_statement_from(TSqlParser::Delete_statement_fromContext *ctx) override;
+-		antlrcpp::Any visitMerge_statement(TSqlParser::Merge_statementContext *ctx) override { handle(INSTR_UNSUPPORTED_TSQL_MERGE, "MERGE", getLineAndPos(ctx)); return visitChildren(ctx); }
++		/* MERGE runs on PostgreSQL's MERGE (tsql-merge patch); TOP is checked where the statement is rewritten */
++		antlrcpp::Any visitMerge_statement(TSqlParser::Merge_statementContext *ctx) override { return visitChildren(ctx); }
+ 		antlrcpp::Any visitBulk_insert_statement(TSqlParser::Bulk_insert_statementContext *ctx) override;
+ 
+ 		// CFL
+--- a/contrib/babelfishpg_tsql/src/tsqlIface.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlIface.cpp
+@@ -7764,10 +7764,159 @@
+ 	mutator->add(last->getStopIndex() + 1, "", clauses);
+ }
+ 
++/*
++ * MERGE (tsql-merge patch). PostgreSQL 17 has MERGE with WHEN NOT MATCHED [BY TARGET] / BY SOURCE,
++ * RETURNING and merge_action(); the T-SQL statement differs from it only in the places rewritten here:
++ *  - INTO is optional in T-SQL;
++ *  - table hints on the target and on the source (WITH (HOLDLOCK) of the upsert idiom) and OPTION (...)
++ *    are dropped like in UPDATE/DELETE: PostgreSQL locks the target rows it matches and has no key-range
++ *    locks;
++ *  - OUTPUT becomes RETURNING: inserted.c is the target row after the action and deleted.c the target row
++ *    of a DELETE (NULL for the rows of the other actions, as on SQL Server); PostgreSQL 17 cannot return the
++ *    row before an UPDATE, so deleted.* together with WHEN MATCHED THEN UPDATE is refused; $action is
++ *    merge_action() ('INSERT' / 'UPDATE' / 'DELETE', the same strings);
++ *  - OUTPUT ... INTO t [(cols)] becomes WITH bbf_merge_output AS (MERGE ... RETURNING ...)
++ *    INSERT INTO t [(cols)] SELECT * FROM bbf_merge_output (EF Core's batched insert uses OUTPUT INTO @t).
++ * Qualified SET targets (SET target.c = ...) are resolved later like in UPDATE.
++ */
++static void
++collect_terminals(antlr4::tree::ParseTree *tree, std::vector<antlr4::tree::TerminalNode *> &out)
++{
++	for (auto child : tree->children)
++	{
++		if (auto term = dynamic_cast<antlr4::tree::TerminalNode *>(child))
++			out.push_back(term);
++		else
++			collect_terminals(child, out);
++	}
++}
++
++static void
++process_merge_statement(TSqlParser::Merge_statementContext *mctx, PLtsql_expr_query_mutator *mutator)
++{
++	PLtsql_expr *sqlstmt = mutator->expr;
++	bool		has_insert = false;
++	bool		has_update = false;
++	bool		has_delete = false;
++	std::string target;
++
++	if (mctx->TOP())
++		throw PGErrorWrapperException(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, "MERGE TOP is not supported in Babelfish", getLineAndPos(mctx->TOP()));
++
++	for (auto wctx : mctx->when_matches())
++	{
++		if (wctx->merge_not_matched())
++			has_insert = true;
++		else if (wctx->merge_matched() && wctx->merge_matched()->DELETE())
++			has_delete = true;
++		else if (wctx->merge_matched())
++		{
++			has_update = true;
++			for (auto ectx : wctx->merge_matched()->update_elem_merge())
++				if (ectx->LOCAL_ID() || ectx->udt_column_name)
++					throw PGErrorWrapperException(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, "MERGE ... UPDATE SET of a variable or a method call is not supported in Babelfish", getLineAndPos(ectx));
++		}
++	}
++
++	if (!mctx->INTO())
++		mutator->add(mctx->MERGE()->getSymbol()->getStopIndex() + 1, "", " INTO");
++
++	if (mctx->with_table_hints())
++		removeCtxStringFromQuery(sqlstmt, mctx->with_table_hints(), mutator->ctx);
++	if (mctx->as_table_alias())
++	{
++		target = ::getFullText(mctx->as_table_alias()->table_alias()->id());
++		if (mctx->as_table_alias()->table_alias()->with_table_hints())
++			removeCtxStringFromQuery(sqlstmt, mctx->as_table_alias()->table_alias()->with_table_hints(), mutator->ctx);
++	}
++	else if (mctx->ddl_object()->full_object_name())
++		target = ::getFullText(mctx->ddl_object()->full_object_name()->object_name);
++	else
++		target = ::getFullText(mctx->ddl_object());
++
++	if (mctx->table_sources())
++		for (auto tctx : mctx->table_sources()->table_source_item())
++			post_process_table_source(tctx, sqlstmt, mutator->ctx);
++
++	if (mctx->option_clause())
++	{
++		removeCtxStringFromQuery(sqlstmt, mctx->option_clause(), mutator->ctx);
++		extractQueryHintsFromOptionClause(mctx->option_clause());
++	}
++
++	auto octx = mctx->output_clause();
++	if (!octx)
++		return;
++	if (octx->output_clause())
++		throw PGErrorWrapperException(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, "MERGE with more than one OUTPUT clause is not supported in Babelfish", getLineAndPos(octx->output_clause()));
++
++	mutator->add(octx->OUTPUT()->getSymbol()->getStartIndex(), octx->OUTPUT()->getText(), "RETURNING");
++	for (auto elem : octx->output_dml_list_elem())
++	{
++		std::vector<antlr4::tree::TerminalNode *> toks;
++		bool		bare = elem->output_column_name() && !elem->as_column_alias();	/* the column is the whole element */
++
++		collect_terminals(elem, toks);
++		for (size_t i = 0; i < toks.size(); i++)
++		{
++			antlr4::Token *tok = toks[i]->getSymbol();
++			bool		ins = tok->getType() == TSqlParser::INSERTED;
++			bool		del = tok->getType() == TSqlParser::DELETED;
++
++			if (tok->getType() == TSqlParser::DOLLAR_ACTION)
++			{
++				mutator->add(tok->getStartIndex(), tok->getText(), bare ? "CAST(merge_action() AS NVARCHAR(10)) AS [$action]" : "CAST(merge_action() AS NVARCHAR(10))");
++				continue;
++			}
++			if (!(ins || del) || i + 2 >= toks.size() || toks[i + 1]->getSymbol()->getType() != TSqlParser::DOT)
++				continue;
++
++			antlr4::Token *col = toks[i + 2]->getSymbol();
++			bool		star = col->getType() == TSqlParser::STAR;
++
++			if (del && has_update)
++				throw PGErrorWrapperException(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, "OUTPUT deleted in a MERGE that updates is not supported in Babelfish (PostgreSQL 17 cannot return the row before an UPDATE)", getLineAndPos(elem));
++			/* every row of the statement has this pseudo table: the target row is it */
++			if (ins ? !has_delete : !has_insert)
++				mutator->add(tok->getStartIndex(), tok->getText(), target);
++			else if (star)
++				throw PGErrorWrapperException(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, "OUTPUT inserted.* or deleted.* in a MERGE that both inserts and deletes is not supported in Babelfish", getLineAndPos(elem));
++			else
++			{
++				mutator->add(tok->getStartIndex(), tok->getText(),
++							 std::string("(CASE WHEN merge_action() ") + (ins ? "<>" : "=") + " 'DELETE' THEN " + target);
++				mutator->add(col->getStopIndex() + 1, "", bare ? " END) AS " + col->getText() : std::string(" END)"));
++			}
++			i += 2;
++		}
++	}
++
++	if (octx->INTO())
++	{
++		size_t		from = octx->INTO()->getSymbol()->getStartIndex();
++		size_t		to = octx->getStop()->getStopIndex();
++		std::string into = octx->LOCAL_ID() ? "\"" + octx->LOCAL_ID()->getText() + "\"" : ::getFullText(octx->table_name());
++
++		if (octx->column_name_list())
++			into += " (" + ::getFullText(octx->column_name_list()) + ")";
++		/* the INTO part moves behind the MERGE: drop other rewrites inside it (the local id quoting) */
++		for (auto it = local_id_positions.begin(); it != local_id_positions.end();)
++			it = (it->first >= from && it->first <= to) ? local_id_positions.erase(it) : std::next(it);
++		for (auto it = rewritten_query_fragment.begin(); it != rewritten_query_fragment.end();)
++			it = (it->first >= from && it->first <= to) ? rewritten_query_fragment.erase(it) : std::next(it);
++		replaceTokenStringFromQuery(sqlstmt, octx->INTO()->getSymbol(), octx->getStop(), NULL, mutator->ctx);
++		mutator->add(mctx->MERGE()->getSymbol()->getStartIndex(), "",
++					 mctx->with_expression() ? ", bbf_merge_output AS (" : "WITH bbf_merge_output AS (");
++		mutator->add(to + 1, "", ") INSERT INTO " + into + " SELECT * FROM bbf_merge_output");
++	}
++}
++
+ void process_execsql_remove_unsupported_tokens(TSqlParser::Dml_statementContext *ctx, PLtsql_expr_query_mutator *exprMutator)
+ {
+ 	PLtsql_expr * sqlstmt = exprMutator->expr;
+-	if (ctx->insert_statement())
++	if (ctx->merge_statement())
++		process_merge_statement(ctx->merge_statement(), exprMutator);
++	else if (ctx->insert_statement())
+ 	{
+ 		auto ictx = ctx->insert_statement();
+ 		if (ictx->with_table_hints() && ictx->with_table_hints()->WITH()) // table hints
+--- a/contrib/babelfishpg_tsql/src/pl_exec.c
++++ b/contrib/babelfishpg_tsql/src/pl_exec.c
+@@ -5040,6 +5040,8 @@
+ 			case SPI_OK_INSERT_RETURNING:
+ 			case SPI_OK_UPDATE_RETURNING:
+ 			case SPI_OK_DELETE_RETURNING:
++			case SPI_OK_MERGE:		/* tsql-merge patch */
++			case SPI_OK_MERGE_RETURNING:
+ 				Assert(stmt->mod_stmt);
+ 				exec_set_found(estate, (SPI_processed != 0));
+ 				break;
+@@ -5907,6 +5909,8 @@
+ 		case SPI_OK_INSERT_RETURNING:
+ 		case SPI_OK_UPDATE_RETURNING:
+ 		case SPI_OK_DELETE_RETURNING:
++		case SPI_OK_MERGE:			/* tsql-merge patch */
++		case SPI_OK_MERGE_RETURNING:
+ 		case SPI_OK_UTILITY:
+ 		case SPI_OK_REWRITTEN:
+ 			break;
+--- a/contrib/babelfishpg_tsql/src/pl_exec-2.c
++++ b/contrib/babelfishpg_tsql/src/pl_exec-2.c
+@@ -817,6 +823,8 @@
+ 			rc = SPI_OK_DELETE_RETURNING;
+ 		else if (cmd == CMD_UPDATE)
+ 			rc = SPI_OK_UPDATE_RETURNING;
++		else if (cmd == CMD_MERGE)	/* tsql-merge patch */
++			rc = SPI_OK_MERGE_RETURNING;
+ 	}
+ 
+ 	receiver->rDestroy(receiver);
+--- a/contrib/babelfishpg_tsql/src/prepare.c
++++ b/contrib/babelfishpg_tsql/src/prepare.c
+@@ -71,7 +71,8 @@
+ 		if (plansource->commandTag &&
+ 			(plansource->commandTag == CMDTAG_INSERT ||
+ 			 plansource->commandTag == CMDTAG_UPDATE ||
+-			 plansource->commandTag == CMDTAG_DELETE))
++			 plansource->commandTag == CMDTAG_DELETE ||
++			 plansource->commandTag == CMDTAG_MERGE))
+ 		{
+ 			ListCell   *lc;
+ 			int			n;
+@@ -92,6 +93,9 @@
+ 				case T_DeleteStmt:
+ 					relname = ((DeleteStmt *) plansource->raw_parse_tree->stmt)->relation->relname;
+ 					break;
++				case T_MergeStmt:	/* tsql-merge patch */
++					relname = ((MergeStmt *) plansource->raw_parse_tree->stmt)->relation->relname;
++					break;
+ 				default:
+ 					ereport(ERROR,
+ 							(errcode(ERRCODE_INTERNAL_ERROR),
+--- a/contrib/babelfishpg_tsql/src/multidb.c
++++ b/contrib/babelfishpg_tsql/src/multidb.c
+@@ -86,8 +86,9 @@
+				break;
+			}
+		case T_UpdateStmt:
+		case T_DeleteStmt:
+		case T_InsertStmt:
++		case T_MergeStmt:		/* schema-qualified target and source (tsql-merge patch) */
+			{
+				/*
+				 * For INSERT ... EXECUTE, rewrite the schema name
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdsresponse.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdsresponse.c
+@@ -2745,6 +2745,12 @@
+ 								command_type = TDS_CMD_DELETE;
+ 								row_count_valid = !estate->insert_exec;
+ 							}
++							/* MERGE reports its rows like SQL Server (CurCmd 279; tsql-merge patch) */
++							else if (plansource->commandTag == CMDTAG_MERGE)
++							{
++								command_type = 0x117;
++								row_count_valid = !estate->insert_exec;
++							}
+ 
+ 							/*
+ 							 * [BABEL-2090] SELECT statement should show 'rows
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -3060,6 +3060,24 @@
+ 					break;		/* concurrent update/delete */
+ 				}
+ 
++				/*
++				 * T-SQL INSTEAD OF UPDATE trigger: keep the row for the
++				 * statement trigger fireISTriggers fires, as ExecUpdate does
++				 * (tsql-merge patch).
++				 */
++				if (sql_dialect == SQL_DIALECT_TSQL && resultRelInfo->ri_TrigDesc &&
++					resultRelInfo->ri_TrigDesc->trig_update_instead_statement &&
++					bbf_view_has_instead_trigger(resultRelInfo->ri_RelationDesc, CMD_UPDATE, NIL) &&
++					isTsqlInsteadofTriggerExecution(estate, resultRelInfo, TRIGGER_EVENT_INSTEAD))
++				{
++					ExecIRUpdateTriggersTSQL(estate, resultRelInfo, tupleid, oldtuple, newslot,
++											 mtstate->mt_transition_capture);
++					mtstate->mt_merge_updated += 1;
++					if (canSetTag)
++						(estate->es_processed)++;
++					goto out;
++				}
++
+ 				/* INSTEAD OF ROW UPDATE Triggers */
+ 				if (resultRelInfo->ri_TrigDesc &&
+ 					resultRelInfo->ri_TrigDesc->trig_update_instead_row)
+@@ -3113,6 +3131,20 @@
+ 					break;		/* concurrent update/delete */
+ 				}
+ 
++				/* T-SQL INSTEAD OF DELETE trigger, as for UPDATE above */
++				if (sql_dialect == SQL_DIALECT_TSQL && resultRelInfo->ri_TrigDesc &&
++					resultRelInfo->ri_TrigDesc->trig_delete_instead_statement &&
++					bbf_view_has_instead_trigger(resultRelInfo->ri_RelationDesc, CMD_DELETE, NIL) &&
++					isTsqlInsteadofTriggerExecution(estate, resultRelInfo, TRIGGER_EVENT_DELETE))
++				{
++					ExecIRDeleteTriggersTSQL(estate, resultRelInfo, tupleid, oldtuple,
++											 mtstate->mt_transition_capture);
++					mtstate->mt_merge_deleted += 1;
++					if (canSetTag)
++						(estate->es_processed)++;
++					goto out;
++				}
++
+ 				/* INSTEAD OF ROW DELETE Triggers */
+ 				if (resultRelInfo->ri_TrigDesc &&
+ 					resultRelInfo->ri_TrigDesc->trig_delete_instead_row)
+@@ -3900,7 +3932,22 @@
+ 			ret = ExecISDeleteTriggers(node->ps.state, resultRelInfo, node->mt_transition_capture);
+ 			break;
+ 		case CMD_MERGE:
+-			elog(ERROR, "Merge is unsupported in TSQL");
++			{
++				/*
++				 * Fire the INSTEAD OF trigger of every action the statement has
++				 * (tsql-merge patch); ExecMergeMatched and ExecInsert captured
++				 * the rows instead of changing them.
++				 */
++				IOTState	st[3] = {IOT_NOT_REQUIRED, IOT_NOT_REQUIRED, IOT_NOT_REQUIRED};
++
++				if (node->mt_merge_subcommands & MERGE_INSERT)
++					st[0] = ExecISInsertTriggers(node->ps.state, resultRelInfo, node->mt_transition_capture);
++				if (node->mt_merge_subcommands & MERGE_UPDATE)
++					st[1] = ExecISUpdateTriggers(node->ps.state, resultRelInfo, node->mt_transition_capture);
++				if (node->mt_merge_subcommands & MERGE_DELETE)
++					st[2] = ExecISDeleteTriggers(node->ps.state, resultRelInfo, node->mt_transition_capture);
++				ret = (st[0] == IOT_FIRED || st[1] == IOT_FIRED || st[2] == IOT_FIRED) ? IOT_FIRED : IOT_NOT_REQUIRED;
++			}
+ 			break;
+ 		default:
+ 			elog(ERROR, "unknown operation");
+--- a/src/backend/executor/execMain.c
++++ b/src/backend/executor/execMain.c
+@@ -1090,8 +1090,7 @@
+ 			 * it's not worth great exertion to get).
+ 			 */
+ 			if (!view_has_instead_trigger(resultRel, operation, mergeActions) &&
+-				!(sql_dialect == SQL_DIALECT_TSQL && bbfViewHasInsteadofTrigger_hook && 
+-				(bbfViewHasInsteadofTrigger_hook)(resultRel, operation)))
++				!bbf_view_has_instead_trigger(resultRel, operation, mergeActions))
+ 			{
+ 				error_view_not_updatable(resultRel, operation, mergeActions,
+ 										 NULL);
+--- a/src/backend/rewrite/rewriteHandler.c
++++ b/src/backend/rewrite/rewriteHandler.c
+@@ -2638,6 +2638,29 @@
+ 
+ 
+ /*
++ * bbf_view_has_instead_trigger - T-SQL counterpart of view_has_instead_trigger.
++ *
++ * T-SQL INSTEAD OF triggers are statement triggers, which bbfViewHasInsteadofTrigger_hook
++ * looks for. The hook takes one action, so for MERGE it is asked for every action, like
++ * view_has_instead_trigger does for row triggers (tsql-merge patch).
++ */
++bool
++bbf_view_has_instead_trigger(Relation view, CmdType event, List *mergeActionList)
++{
++	if (sql_dialect != SQL_DIALECT_TSQL || !bbfViewHasInsteadofTrigger_hook)
++		return false;
++	if (event != CMD_MERGE)
++		return (bbfViewHasInsteadofTrigger_hook) (view, event);
++	foreach_node(MergeAction, action, mergeActionList)
++	{
++		if (action->commandType != CMD_NOTHING &&
++			!(bbfViewHasInsteadofTrigger_hook) (view, action->commandType))
++			return false;
++	}
++	return true;
++}
++
++/*
+  * view_col_is_auto_updatable - test whether the specified column of a view
+  * is auto-updatable. Returns NULL (if the column can be updated) or a message
+  * string giving the reason that it cannot be.
+@@ -4291,7 +4314,8 @@
+ 			rt_entry_relation->rd_rel->relkind == RELKIND_VIEW &&
+ 			(!view_has_instead_trigger(rt_entry_relation, event,
+ 									  parsetree->mergeActionList)
+-			&& !(sql_dialect == SQL_DIALECT_TSQL && bbfViewHasInsteadofTrigger_hook && (bbfViewHasInsteadofTrigger_hook)(rt_entry_relation, event))))
++			&& !bbf_view_has_instead_trigger(rt_entry_relation, event,
++											 parsetree->mergeActionList)))
+ 		{
+ 			/*
+ 			 * If there were any qualified INSTEAD rules, don't allow the view
+--- a/src/include/rewrite/rewriteHandler.h
++++ b/src/include/rewrite/rewriteHandler.h
+@@ -25,6 +25,8 @@
+ extern Node *build_column_default(Relation rel, int attrno);
+ 
+ extern Query *get_view_query(Relation view);
++extern bool bbf_view_has_instead_trigger(Relation view, CmdType event,
++										 List *mergeActionList);
+ extern bool view_has_instead_trigger(Relation view, CmdType event,
+ 									 List *mergeActionList);
+ extern const char *view_query_is_auto_updatable(Query *viewquery,

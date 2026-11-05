@@ -1,0 +1,92 @@
+--- a/contrib/babelfishpg_tsql/src/pl_exec-2.c
++++ b/contrib/babelfishpg_tsql/src/pl_exec-2.c
+@@ -122,6 +122,12 @@
+ BulkCopyStmt *cstmt = NULL;
+ bool		called_from_tsql_insert_execute = false;
+ 
++/*
++ * Row type of the INSERT ... EXECUTE an EXEC (@sql) batch runs under; set by
++ * exec_stmt_exec_batch, taken by pltsql_inline_handler (insert-exec-batch patch).
++ */
++TupleDesc	pltsql_insert_exec_batch_desc = NULL;
++
+ int			insert_bulk_rows_per_batch = DEFAULT_INSERT_BULK_ROWS_PER_BATCH;
+ int			insert_bulk_kilobytes_per_batch = DEFAULT_INSERT_BULK_PACKET_SIZE;
+ bool		insert_bulk_keep_nulls = false;
+@@ -1517,6 +1525,25 @@
+ 		codeblock->langOid = 0;
+ 		codeblock->langIsTrusted = true;
+ 		codeblock->atomic = false;
++
++		/*
++		 * EXEC (@sql) in a procedure that runs under INSERT ... EXECUTE:
++		 * its result sets go to the INSERT as well, as on SQL Server
++		 * (INSERT INTO @t EXEC sp_MSforeachdb ...; insert-exec-batch
++		 * patch). They went to the client. The batch is given the row type
++		 * and puts its rows into this procedure's tuple store.
++		 */
++		if (estate->insert_exec && estate->rsi && estate->rsi->expectedDesc)
++		{
++			DestReceiver *dest = CreateDestReceiver(DestTuplestore);
++
++			if (estate->tuple_store == NULL)
++				exec_init_tuple_store(estate);
++			SetTuplestoreDestReceiverParams(dest, estate->tuple_store, estate->tuple_store_cxt,
++											false, NULL, NULL);
++			codeblock->dest = (Node *) dest;
++			pltsql_insert_exec_batch_desc = estate->rsi->expectedDesc;
++		}
+ 		MemSet(fcinfo, 0, SizeForFunctionCallInfo(1));
+ 		fcinfo->args[0].value = PointerGetDatum(codeblock);
+ 		fcinfo->args[0].isnull = false;
+@@ -1531,6 +1558,7 @@
+ 	}
+ 	PG_FINALLY();
+ 	{
++		pltsql_insert_exec_batch_desc = NULL;
+ 		/* Restore past settings */
+ 		pltsql_revert_guc(save_nestlevel);
+ 		pltsql_revert_last_scope_identity(scope_level);
+--- a/contrib/babelfishpg_tsql/src/pl_handler.c
++++ b/contrib/babelfishpg_tsql/src/pl_handler.c
+@@ -109,6 +111,7 @@
+ 
+ extern int  escape_hatch_set_transaction_isolation_level;
+ extern bool pltsql_recursive_triggers;
++extern TupleDesc pltsql_insert_exec_batch_desc;
+ extern bool restore_tsql_tabletype;
+ extern bool babelfish_dump_restore;
+ extern bool pltsql_nocount;
+@@ -6541,6 +6584,10 @@
+ 	bool		nonatomic;
+ 	bool		support_tsql_trans = pltsql_support_tsql_transactions();
+ 	ReturnSetInfo rsinfo;		/* for INSERT ... EXECUTE */
++	TupleDesc	batch_desc = pltsql_insert_exec_batch_desc;	/* insert-exec-batch patch */
++
++	/* this batch only: batches it runs are not under the INSERT unless they say so */
++	pltsql_insert_exec_batch_desc = NULL;
+ 
+ 	/*
+ 	 * FIXME: We leak sp_describe_first_result_set_inprogress if CREATE VIEW
+@@ -6654,7 +6701,20 @@
+ 	 * communication before invoking the function, which can accumulate the
+ 	 * result sets.
+ 	 */
+-	if (codeblock->relation && codeblock->attrnos)
++	if (batch_desc && codeblock->dest)
++	{
++		/* EXEC (@sql) under INSERT ... EXECUTE: the row type is the caller's */
++		fake_fcinfo->resultinfo = (Node *) &rsinfo;
++		rsinfo.type = T_ReturnSetInfo;
++		rsinfo.econtext = CreateExprContext(simple_eval_estate);
++		rsinfo.expectedDesc = CreateTupleDescCopy(batch_desc);
++		rsinfo.allowedModes = (int) (SFRM_ValuePerCall | SFRM_Materialize);
++		rsinfo.returnMode = SFRM_ValuePerCall;
++		rsinfo.isDone = ExprSingleResult;
++		rsinfo.setResult = NULL;
++		rsinfo.setDesc = NULL;
++	}
++	else if (codeblock->relation && codeblock->attrnos)
+ 	{
+ 		Oid			reltypeid;
+ 		TupleDesc	reldesc;

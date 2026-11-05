@@ -1,0 +1,65 @@
+--- a/contrib/babelfishpg_tsql/src/pl_handler.c
++++ b/contrib/babelfishpg_tsql/src/pl_handler.c
+@@ -68,6 +68,8 @@
+ #include "utils/builtins.h"
+ #include "utils/guc_tables.h"
+ #include "utils/inval.h"
++#include "catalog/pg_attrdef.h"
++#include "catalog/pg_constraint.h"
+ #include "utils/lsyscache.h"
+ #include "utils/plancache.h"
+ #include "utils/ps_status.h"
+@@ -1046,6 +1049,42 @@
+ 							}
+ 							break;
+ 						}
++						case AT_DropConstraint:
++						{
++							/*
++							 * sys.default_constraints lists a column DEFAULT as
++							 * DF_<table>_<pg_attrdef oid>: PostgreSQL defaults are not
++							 * constraints and have no names. A program that reads the
++							 * name there and drops it (EF Core's DropColumn/AlterColumn:
++							 * SELECT @var = d.name FROM sys.default_constraints ...;
++							 * EXEC('ALTER TABLE t DROP CONSTRAINT [' + @var + ']'))
++							 * gets ALTER COLUMN DROP DEFAULT instead, when the table has
++							 * no real constraint of that name and the oid is a default
++							 * of this table (drop-listed-default patch).
++							 */
++							char	   *us = cmd->name ? strrchr(cmd->name, '_') : NULL;
++							Relation	rel;
++
++							if (us == NULL || pg_strncasecmp(cmd->name, "df_", 3) != 0 ||
++								us[1] == '\0' || strspn(us + 1, "0123456789") != strlen(us + 1))
++								break;
++							rel = relation_openrv_extended(atstmt->relation, AccessShareLock, true);
++							if (rel == NULL)
++								break;
++							if (!OidIsValid(get_relation_constraint_oid(RelationGetRelid(rel), cmd->name, true)))
++							{
++								ObjectAddress col = GetAttrDefaultColumnAddress((Oid) strtoul(us + 1, NULL, 10));
++
++								if (OidIsValid(col.objectId) && col.objectId == RelationGetRelid(rel))
++								{
++									cmd->subtype = AT_ColumnDefault;
++									cmd->name = get_attname(col.objectId, col.objectSubId, false);
++									cmd->def = NULL;
++								}
++							}
++							relation_close(rel, AccessShareLock);
++							break;
++						}
+ 						default:
+ 							break;
+ 					}
+@@ -1432,6 +1471,10 @@
+ 								{
+ 									int			colnamelen = strlen(cmd->name);
+ 
++									/* DROP DEFAULT (a dropped DF_ name, drop-listed-default patch) */
++									if (cmd->def == NULL)
++										break;
++
+ 									if (nodeTag(cmd->def) == T_FuncCall)
+ 									{
+ 										if (atstmt->relation->relpersistence == RELPERSISTENCE_TEMP && 

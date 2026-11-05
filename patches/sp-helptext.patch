@@ -1,0 +1,11 @@
+--- a/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
+@@ -1662,7 +1663,7 @@
+ 	"sp_helpserver",
+ 	"sp_helpsort",
+ 	"sp_helpstats",
+-	"sp_helptext",
++	/* sp_helptext: provided by init.sql (sp-helptext patch) */
+ 	"sp_helptrigger",
+ 	"sp_indexoption",
+ 	"sp_invalidate_textptr"

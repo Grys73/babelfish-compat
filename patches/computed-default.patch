@@ -1,0 +1,136 @@
+--- a/contrib/babelfishpg_tsql/src/tablecmds.c
++++ b/contrib/babelfishpg_tsql/src/tablecmds.c
+@@ -26,6 +26,8 @@
+ #include "commands/tablecmds.h"
+ #include "nodes/nodeFuncs.h"
+ #include "parser/parser.h"
++#include "catalog/pg_proc.h"
++#include "optimizer/optimizer.h"
+ #include "parser/parse_expr.h"
+ #include "parser/parse_type.h"
+ #include "parser/parse_collate.h"
+@@ -358,6 +360,83 @@
+ 									  (void *) context);
+ }
+ 
++/*
++ * computed-default patch: true when a computed column expression reads no
++ * column and its only non-immutable parts are the current date/time functions
++ * (GETDATE(), GETUTCDATE(), SYSDATETIME(), SYSUTCDATETIME(),
++ * SYSDATETIMEOFFSET(), CURRENT_TIMESTAMP).
++ */
++typedef struct
++{
++	bool		time_fn;		/* a current date/time function was found */
++	bool		other_mutable;	/* some other non-immutable part was found */
++} ComputedDefaultContext;
++
++static bool
++computed_default_func_checker(Oid func_id, void *context)
++{
++	ComputedDefaultContext *c = (ComputedDefaultContext *) context;
++	char	   *name;
++
++	if (func_volatile(func_id) == PROVOLATILE_IMMUTABLE)
++		return false;
++	name = get_func_name(func_id);
++	if (name != NULL && get_func_namespace(func_id) == get_namespace_oid("sys", true) &&
++		(strcmp(name, "getdate") == 0 || strcmp(name, "getutcdate") == 0 ||
++		 strcmp(name, "sysdatetime") == 0 || strcmp(name, "sysutcdatetime") == 0 ||
++		 strcmp(name, "sysdatetimeoffset") == 0))
++	{
++		c->time_fn = true;
++		return false;
++	}
++	c->other_mutable = true;
++	return true;
++}
++
++static bool
++computed_default_walker(Node *node, void *context)
++{
++	ComputedDefaultContext *c = (ComputedDefaultContext *) context;
++
++	if (node == NULL)
++		return false;
++	if (check_functions_in_node(node, computed_default_func_checker, context))
++		return true;
++	if (IsA(node, SQLValueFunction))
++	{
++		switch (((SQLValueFunction *) node)->op)
++		{
++			case SVFOP_CURRENT_DATE:
++			case SVFOP_CURRENT_TIMESTAMP:
++			case SVFOP_CURRENT_TIMESTAMP_N:
++			case SVFOP_LOCALTIMESTAMP:
++			case SVFOP_LOCALTIMESTAMP_N:
++				c->time_fn = true;
++				return false;
++			default:
++				c->other_mutable = true;
++				return true;
++		}
++	}
++	if (IsA(node, NextValueExpr) || IsA(node, Param) || IsA(node, SubLink))
++	{
++		c->other_mutable = true;
++		return true;
++	}
++	return expression_tree_walker(node, computed_default_walker, context);
++}
++
++static bool
++computed_column_as_default(Node *expr)
++{
++	ComputedDefaultContext c = {false, false};
++
++	if (contain_var_clause(expr))
++		return false;
++	(void) computed_default_walker((Node *) expression_planner((Expr *) copyObject(expr)), &c);
++	return c.time_fn && !c.other_mutable;
++}
++
+ static void
+ pltsql_PreAddConstraintsHook(Relation rel, ParseState *pstate, List *newColDefaults)
+ {
+@@ -415,6 +494,7 @@
+ 		Type		targetType;
+ 		Form_pg_attribute attTup;
+ 		Form_pg_type tform;
++		bool		as_default;
+ 
+ 		/* skip if not a computed column */
+ 		if (!atp->attgenerated)
+@@ -437,6 +517,20 @@
+ 		 */
+ 		expr = transformExpr(pstate, colDef->raw_default, EXPR_KIND_GENERATED_COLUMN);
+ 
++		/*
++		 * A computed column that reads no column of the row and whose only
++		 * non-immutable parts are the current date/time functions
++		 * ([CreatedAt] AS GETDATE() of EF Core migrations) cannot be a
++		 * PostgreSQL generated column ("generation expression is not
++		 * immutable"). SQL Server evaluates it when the row is read; the
++		 * closest PostgreSQL has is a DEFAULT, evaluated when the row is
++		 * inserted, so the column becomes a plain column with that default
++		 * (computed-default patch). Other expressions (reading columns, or
++		 * RAND(), NEWID(), language-dependent casts) keep the PostgreSQL
++		 * error.
++		 */
++		as_default = computed_column_as_default(expr);
++
+ 		/* extract the type and other relevant information */
+ 		targettype = exprType(expr);
+ 		targettypmod = exprTypmod(expr);
+@@ -460,6 +554,11 @@
+ 
+ 		attTup->atttypid = targettype;
+ 		attTup->atttypmod = targettypmod;
++		if (as_default)
++		{
++			attTup->attgenerated = '\0';
++			colDef->generated = '\0';
++		}
+ 
+ 		/*
+ 		 * The target column should already be having a collation associated
