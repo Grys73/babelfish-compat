@@ -58,7 +58,7 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
 | Patch | Files | What it fixes |
 |---|---|---|
 | `empty-lob-not-null.patch` | tdsbulkload.c | A bulk load stored an empty `text` / `ntext` / `image` value as NULL. TDS marks NULL for these types with a zero-length text pointer; the code also treated a value of length 0 as NULL. |
-| `session-language.patch` | gram-tsql-rule.y, guc.c | `SET LANGUAGE` and the login language always ended on `us_english`. The SQL Server languages (by name or alias) are now kept as the session language, stored by name like SQL Server's `@@language`, so applications that select data by language see it. Dates and messages stay `us_english`. |
+| `session-language.patch` | gram-tsql-rule.y, guc.c | `SET LANGUAGE` and the login language always ended on `us_english`. The SQL Server languages (by name or alias) are now kept as the session language, so `@@langid` (`sys.langid()` in `init.sql`) and the `babelfishpg_tsql.language` setting follow `SET LANGUAGE`, and applications that select data by language see it. `@@language` itself still returns `us_english`. Dates and messages stay `us_english`. |
 | `language-default.patch` | guc.c | A server default language (`babelfishpg_tsql.language` in `postgresql.conf` or `ALTER SYSTEM`) crashed backends on start and on a configuration reload: the assign hook sent the change to the client through the protocol plugin also where there is no request. Now only inside a transaction. A connection without a login language then gets the server default, as on SQL Server. |
 | `udt-arg-quote.patch` | hooks.c | Scalar functions with user-defined-type arguments failed to create in databases whose name needs quoting (e.g. starts with a digit): the schema name was put bare into a re-parsed GRANT list. |
 | `xml-strip-bom.patch` | PostgreSQL xml.c, tdstypeio.c | SQL Server never stores or returns a byte order mark in an `xml` value; Babelfish kept a leading U+FEFF. SqlClient sends every `xml` parameter and bulk value as UTF-16 with FF FE, so every .NET write stored one, and `XDocument.Parse` then failed on read. Stripped on input and on output (output also covers values stored earlier). |
@@ -196,7 +196,12 @@ Temp-table owner and INSERT ... EXEC (expression) update (`temp-owner.patch`, `i
   owner, as before.
 - `INSERT INTO @t EXEC (...)` with a concatenation, a variable and a literal, inside and outside procedures and
   transactions, and `INSERT ... EXEC proc args`, return the expected rows.
-- PostgreSQL and JDBC suites were not rerun for this update.
+- Full rerun on x64 with this repository as published (all 20 patches, `init.sql`): PostgreSQL `make check`
+  227/227, isolation 118/118. Babelfish JDBC suite (3598 files, multi-db): 148 failing files. Against the
+  previous build, 3 newly failing files are the intended FILESTREAM catalog rows (`sys-database_files`,
+  `sys-database_files-vu-verify`, `sys-filegroups-vu-verify`: one extra FILESTREAM file / filegroup row);
+  4 files now pass that failed there only because of a private init script of that build. No file fails
+  because of `temp-owner.patch` or `insert-exec-expr.patch`.
 
 ## Licence
 
