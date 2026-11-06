@@ -231,3 +231,16 @@ grant select on sys.database_files to public;
 create or replace function sys.get_filestream_transaction_context() returns sys.bbf_varbinary
 language plpgsql immutable as $$ begin return null; end $$;
 grant execute on function sys.get_filestream_transaction_context() to public;
+
+-- INSERT ... EXEC (<expression>) (with insert-exec-expr.patch and insert-exec-batch.patch). Babelfish took only
+-- a string literal there; INSERT INTO @t EXEC ('select ... from dbo.' + @tbl) or EXEC (@sql) was a syntax error.
+-- The patch turns any other expression into a call of this procedure, whose EXEC (@sql) hands its rows to the
+-- INSERT. Caller's rights (no SECURITY DEFINER), as the caller's own EXEC (...) would run.
+create or replace procedure sys.bbf_compat_insert_exec(IN "@sql" sys.nvarchar)
+language pltsql
+as '{"version_num": "1", "typmod_array": ["-1"], "original_probin": ""}', $procedure$
+BEGIN
+ EXEC (@sql);
+END;
+$procedure$;
+grant execute on procedure sys.bbf_compat_insert_exec(sys.nvarchar) to public;

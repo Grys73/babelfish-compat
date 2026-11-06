@@ -1,0 +1,67 @@
+--- a/contrib/babelfishpg_tsql/src/hooks.c
++++ b/contrib/babelfishpg_tsql/src/hooks.c
+@@ -15,6 +15,8 @@
+ #include "catalog/catalog.h"
+ #include "catalog/dependency.h"
+ #include "catalog/namespace.h"
++#include "catalog/pg_attrdef.h"
++#include "catalog/pg_constraint.h"
+ #include "catalog/objectaccess.h"
+ #include "catalog/pg_aggregate.h"
+ #include "catalog/pg_attrdef_d.h"
+@@ -259,6 +261,7 @@
+  *****************************************/
+ static object_access_hook_type prev_object_access_hook = NULL;
+ static void bbf_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId, int subId, void *arg);
++static bool skip_db_owner_reassign(Oid classId, Oid objectId);
+ static void revoke_func_permission_from_public(Oid objectId);
+ static bool is_partitioned_table_reloptions_allowed(Datum reloptions);
+ static Oid pltsql_get_object_owner(Oid namespaceId, Oid ownerId);
+@@ -3641,10 +3644,46 @@
+ 		exec_internal_grant_on_function(objectId);
+ 	}
+ 
+-	if (access == OAT_POST_CREATE)
++	if (access == OAT_POST_CREATE && !skip_db_owner_reassign(classId, objectId))
+ 		change_object_owner_if_db_owner();
+ }
+ 
++/*
++ * temp-owner patch: change_object_owner_if_db_owner() runs REASSIGN OWNED BY
++ * <user> TO <user>_bbfobj after every new object of a db_owner member. For
++ * "create table #t(id int identity)" or "declare @t table(id int identity,
++ * c int default 0)" the identity sequence, created first, was moved to
++ * <user>_bbfobj by the sequence's, row types' or default's hook while the
++ * temporary table stayed the user's, so OWNED BY failed: "sequence must have
++ * same owner as table it is linked to". Temporary objects are the session's
++ * own and stay with the user; defaults and constraints have no owner (their
++ * table's own hook has reassigned already).
++ */
++static bool
++skip_db_owner_reassign(Oid classId, Oid objectId)
++{
++	Oid			nsp = InvalidOid;
++
++	if (classId == AttrDefaultRelationId || classId == ConstraintRelationId)
++		return true;
++
++	/* a lookup that misses (new permanent tuple not visible yet) reassigns as before */
++	if (classId == RelationRelationId)
++		nsp = get_rel_namespace(objectId);
++	else if (classId == TypeRelationId)
++	{
++		HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(objectId));
++
++		if (HeapTupleIsValid(tup))
++		{
++			nsp = ((Form_pg_type) GETSTRUCT(tup))->typnamespace;
++			ReleaseSysCache(tup);
++		}
++	}
++
++	return OidIsValid(nsp) && isAnyTempNamespace(nsp);
++}
++
+ static void
+ revoke_func_permission_from_public(Oid objectId)
+ {

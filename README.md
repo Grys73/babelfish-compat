@@ -75,6 +75,8 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
 | `drop-listed-default.patch` | pl_handler.c | `sys.default_constraints` names a column default `DF_<table>_<oid>` (PostgreSQL defaults are not constraints and have no names). EF Core's DropColumn / AlterColumn reads that name and runs `ALTER TABLE t DROP CONSTRAINT [DF_t_12345]`, which failed. A DROP CONSTRAINT with a name of that form that is not a real constraint, and whose oid is a default of the same table, now drops the column default. Real constraints are dropped as before. |
 | `index-rename.patch` | procedures.c | Babelfish stores an index under a name built from the index name and the table name and looks it up that way. After `sp_rename 'Old', 'New'` the indexes kept the old table name, so a following `sp_rename 'New.IX_Old_x', 'IX_New_x', 'INDEX'` or `DROP INDEX ... ON New` (both in EF Core migrations) failed. A table rename now renames its indexes to the new table's names. Indexes of constraints are not named that way and stay. A rename done on the PostgreSQL side (`ALTER TABLE ... RENAME`) does not rename them, so do not mix the two on one table. |
 | `filestream-pathname.patch` | tsqlIface.cpp | `col.PathName()` and `t.col.PathName()` on a FILESTREAM column failed with 'schema "col" does not exist': the call parsed as function `PathName` in schema `col`. Babelfish keeps a `varbinary(max) FILESTREAM` column as a plain `varbinary(max)` (`escape_hatch_storage_options = 'ignore'`), so there is no file behind the value. The call becomes `CASE WHEN col IS NULL THEN NULL ELSE N'\\BABELFISH\FILESTREAM' END`: clients that read the column itself and only carry the path along work; opening the path (`SqlFileStream`, `OpenSqlFilestream`) does not. Only calls without arguments named `PathName`, and not when `col` is a real schema of the database (a function `dbo.PathName()` stays a call). See the FILESTREAM block in `init.sql`. |
+| `temp-owner.patch` | hooks.c | For a login that is a `db_owner` member but not `dbo`, Babelfish hands every object it creates to the database owner role (`REASSIGN OWNED`) right after creation. For a `#temp` table or a table variable with an `IDENTITY` column the identity sequence was created and reassigned first, while the table stayed with the user, so the statement failed with "sequence must have same owner as table it is linked to" (later "no owned sequence found"). Objects in a temporary namespace (`#temp` tables, table variables, their sequences and types) and column defaults and constraints are no longer reassigned; they are session-private and dropped with the session. Permanent objects are reassigned as before. |
+| `insert-exec-expr.patch` | gram-tsql-rule.y, gram-tsql-prologue.y.h, gram-tsql-epilogue.y.c | `INSERT ... EXEC (...)` took only a string literal: `INSERT INTO @t EXEC ('select ... from dbo.' + @tbl)` or `EXEC (@sql)` was a syntax error. A literal still runs as before; any other expression becomes a call of `sys.bbf_compat_insert_exec(@sql)` from `init.sql`, whose `EXEC (@sql)` hands its rows to the INSERT (needs `insert-exec-batch.patch`). Variables resolve like any procedure argument. |
 
 ### MERGE limits
 
@@ -115,6 +117,8 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
   Babelfish resolves a cross-database `[db].sys.x` reference only in DML statements, not in an `IF`
   condition, so `IF EXISTS (SELECT ... FROM [?].sys.tables ...)` finds nothing; `IF OBJECT_ID('[?].dbo.t',
   'U') IS NOT NULL` works on both servers.
+- `sys.bbf_compat_insert_exec(@sql)` (with `insert-exec-expr.patch`): runs `EXEC (@sql)` so that
+  `INSERT ... EXEC (<expression>)` gets its rows. Caller's rights, no `SECURITY DEFINER`.
 - FILESTREAM (with `filestream-pathname.patch`): `sys.filegroups` also lists a FILESTREAM filegroup (type
   `FD`) and `sys.database_files` (empty in Babelfish) a FILESTREAM file (type 2), so a client that checks
   for FILESTREAM support before using such a column finds it. `GET_FILESTREAM_TRANSACTION_CONTEXT()`
@@ -181,6 +185,18 @@ FILESTREAM update (`filestream-pathname.patch` and the FILESTREAM block in `init
   from 0 bytes to 8 MB with identical SHA-256; list, update, delete and CHECKPOINT work, as a
   non-superuser `db_owner` login too.
 - The PostgreSQL and Babelfish JDBC suites were not rerun for this update.
+
+Temp-table owner and INSERT ... EXEC (expression) update (`temp-owner.patch`, `insert-exec-expr.patch`,
+`sys.bbf_compat_insert_exec` in `init.sql`):
+
+- All patches apply in name order to fresh 5.6.0 / PG 17.10 sources; the image builds on arm64, and an x64
+  build with the same patches ran the tests below.
+- As a `db_owner` login that is not `dbo`: table variables and `#temp` tables with `IDENTITY` columns create,
+  insert and read; tables, procedures and views created by that login still end up owned by the database
+  owner, as before.
+- `INSERT INTO @t EXEC (...)` with a concatenation, a variable and a literal, inside and outside procedures and
+  transactions, and `INSERT ... EXEC proc args`, return the expected rows.
+- PostgreSQL and JDBC suites were not rerun for this update.
 
 ## Licence
 

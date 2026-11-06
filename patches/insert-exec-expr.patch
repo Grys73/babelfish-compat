@@ -1,0 +1,75 @@
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y
+@@ -3068,21 +3068,13 @@
+ 
+ 					$$ = (Node *) n;
+ 				}
+-			| TSQL_EXEC '(' Sconst ')'
++			| TSQL_EXEC '(' a_expr ')'
+ 				{
+-					DoStmt *n = makeNode(DoStmt);
+-					n->args = list_make1(makeDefElem("as",
+-													 (Node *)makeString($3),
+-													 @3));
+-					$$ = (Node *) n;
++					$$ = tsql_insert_exec_expr($3, @1, @3);
+ 				}
+-			| EXECUTE '(' Sconst ')'
++			| EXECUTE '(' a_expr ')'
+ 				{
+-					DoStmt *n = makeNode(DoStmt);
+-					n->args = list_make1(makeDefElem("as",
+-													 (Node *)makeString($3),
+-													 @3));
+-					$$ = (Node *) n;
++					$$ = tsql_insert_exec_expr($3, @1, @3);
+ 				}
+ 		;
+ 
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-prologue.y.h
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-prologue.y.h
+@@ -61,6 +61,7 @@
+ static bool needs_unpivot_source_alias(List *source_cols);
+ static char *generate_unpivot_source_table_alias(const char *base);
+ static char *get_unpivot_source_alias(Node *table_ref);
++static Node *tsql_insert_exec_expr(Node *code, int exec_loc, int code_loc);
+ 
+ static Node *TsqlOpenJSONSimpleMakeFuncCall(Node *jsonExpr, Node *path);
+ static Node *TsqlOpenJSONWithMakeFuncCall(Node *jsonExpr, Node *path, List *cols, Alias *alias);
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-epilogue.y.c
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-epilogue.y.c
+@@ -2607,3 +2607,34 @@
+ 	}
+ 
+ }
++
++/*
++ * INSERT ... EXEC (<code>) (insert-exec-expr patch). A string literal runs as
++ * an inline code block, as before. Any other expression, e.g.
++ * EXEC ('select ' + @col + ' from dbo.' + @tbl) or EXEC (@sql), was a syntax
++ * error; it calls sys.bbf_compat_insert_exec(@sql), whose EXEC (@sql) hands its rows
++ * to the INSERT (insert-exec-batch patch), with the variables resolved like
++ * any procedure argument.
++ */
++static Node *
++tsql_insert_exec_expr(Node *code, int exec_loc, int code_loc)
++{
++	if (IsA(code, A_Const) && !((A_Const *) code)->isnull &&
++		nodeTag(&((A_Const *) code)->val) == T_String)
++	{
++		DoStmt	   *n = makeNode(DoStmt);
++
++		n->args = list_make1(makeDefElem("as",
++										 (Node *) makeString(((A_Const *) code)->val.sval.sval),
++										 code_loc));
++		return (Node *) n;
++	}
++	else
++	{
++		CallStmt   *n = makeNode(CallStmt);
++
++		n->funccall = makeFuncCall(list_make2(makeString("sys"), makeString("bbf_compat_insert_exec")),
++								   list_make1(code), COERCE_EXPLICIT_CALL, exec_loc);
++		return (Node *) n;
++	}
++}
