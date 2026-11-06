@@ -2,7 +2,8 @@
 
 A Docker image of [Babelfish for PostgreSQL](https://babelfishpg.org/) 5.6.0, built from source, with a
 few small compatibility patches and settings for existing T-SQL applications (ADO / OLE DB /
-SqlClient clients, EF Core migrations and MERGE, bulk loads, computed columns, multilingual data).
+SqlClient clients, EF Core migrations and MERGE, bulk loads, computed columns, multilingual data,
+FILESTREAM columns read as varbinary).
 
 This is a personal project by Krzysiek Niedziela. It is not part of the Babelfish project, and the
 patches have not been submitted upstream.
@@ -73,6 +74,7 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
 | `computed-default.patch` | tablecmds.c | A computed column that reads no columns and whose only non-immutable parts are the current date/time functions (`[Created] AS GETDATE()` as EF Core migrations create it; also `GETUTCDATE()`, `SYSDATETIME()`, `SYSUTCDATETIME()`, `SYSDATETIMEOFFSET()`, `CURRENT_TIMESTAMP`) failed with "generation expression is not immutable". **Semantic change:** it becomes a plain column with that expression as its DEFAULT, so the value is the insert time, not "now" on every read, and the column can be written by INSERT / UPDATE (on SQL Server a computed column cannot). Fine for insert timestamps; see "Security notes". Other non-immutable expressions (`RAND()`, `NEWID()`, language-dependent string-to-date casts, `CAST(GETDATE() AS date)`) and expressions that also read columns (`DATEDIFF(day, x, GETDATE())`) still fail as before. `AS GETDATE() PERSISTED` is converted too, where SQL Server refuses it (error 4936). |
 | `drop-listed-default.patch` | pl_handler.c | `sys.default_constraints` names a column default `DF_<table>_<oid>` (PostgreSQL defaults are not constraints and have no names). EF Core's DropColumn / AlterColumn reads that name and runs `ALTER TABLE t DROP CONSTRAINT [DF_t_12345]`, which failed. A DROP CONSTRAINT with a name of that form that is not a real constraint, and whose oid is a default of the same table, now drops the column default. Real constraints are dropped as before. |
 | `index-rename.patch` | procedures.c | Babelfish stores an index under a name built from the index name and the table name and looks it up that way. After `sp_rename 'Old', 'New'` the indexes kept the old table name, so a following `sp_rename 'New.IX_Old_x', 'IX_New_x', 'INDEX'` or `DROP INDEX ... ON New` (both in EF Core migrations) failed. A table rename now renames its indexes to the new table's names. Indexes of constraints are not named that way and stay. A rename done on the PostgreSQL side (`ALTER TABLE ... RENAME`) does not rename them, so do not mix the two on one table. |
+| `filestream-pathname.patch` | tsqlIface.cpp | `col.PathName()` and `t.col.PathName()` on a FILESTREAM column failed with 'schema "col" does not exist': the call parsed as function `PathName` in schema `col`. Babelfish keeps a `varbinary(max) FILESTREAM` column as a plain `varbinary(max)` (`escape_hatch_storage_options = 'ignore'`), so there is no file behind the value. The call becomes `CASE WHEN col IS NULL THEN NULL ELSE N'\\BABELFISH\FILESTREAM' END`: clients that read the column itself and only carry the path along work; opening the path (`SqlFileStream`, `OpenSqlFilestream`) does not. Only calls without arguments named `PathName`, and not when `col` is a real schema of the database (a function `dbo.PathName()` stays a call). See the FILESTREAM block in `init.sql`. |
 
 ### MERGE limits
 
@@ -113,6 +115,13 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
   Babelfish resolves a cross-database `[db].sys.x` reference only in DML statements, not in an `IF`
   condition, so `IF EXISTS (SELECT ... FROM [?].sys.tables ...)` finds nothing; `IF OBJECT_ID('[?].dbo.t',
   'U') IS NOT NULL` works on both servers.
+- FILESTREAM (with `filestream-pathname.patch`): `sys.filegroups` also lists a FILESTREAM filegroup (type
+  `FD`) and `sys.database_files` (empty in Babelfish) a FILESTREAM file (type 2), so a client that checks
+  for FILESTREAM support before using such a column finds it. `GET_FILESTREAM_TRANSACTION_CONTEXT()`
+  returns NULL (no files, so no token; SQL Server's answer outside a transaction). Every database then
+  reports FILESTREAM: leave this block out if no client should use FILESTREAM columns. The column itself
+  needs no patch: `escape_hatch_storage_options` and `escape_hatch_rowguidcol_column` (both `'ignore'` in
+  `start.sh`) keep it as `varbinary(max)` and drop `ROWGUIDCOL`; `NEWSEQUENTIALID()` works as its default.
 
 None of these is `SECURITY DEFINER`.
 
@@ -163,6 +172,15 @@ added in this update (`tsql-merge`, `sp-helptext`, `insert-exec-batch`, `compute
   cross-database), EF Core batched inserts through MERGE ... OUTPUT INTO, a real application's 80 EF Core
   migrations on an empty database with the stock SQL Server provider (DropColumn, RenameTable / RenameIndex,
   computed GETDATE columns), `sp_helptext`, `sp_MSforeachdb` under INSERT EXEC.
+
+FILESTREAM update (`filestream-pathname.patch` and the FILESTREAM block in `init.sql`), on x64:
+
+- The image with all patches builds; a fresh container starts and runs `init.sql`.
+- A SqlClient program running a real application's attachment SQL (FILESTREAM detection,
+  `GET_FILESTREAM_TRANSACTION_CONTEXT()`, `[Data].PathName()` next to `Data`) stored and read back values
+  from 0 bytes to 8 MB with identical SHA-256; list, update, delete and CHECKPOINT work, as a
+  non-superuser `db_owner` login too.
+- The PostgreSQL and Babelfish JDBC suites were not rerun for this update.
 
 ## Licence
 

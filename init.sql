@@ -191,3 +191,43 @@ BEGIN
 END;
 $procedure$;
 grant execute on procedure sys.sp_msforeachdb(sys.nvarchar, sys.nchar, sys.nvarchar, sys.nvarchar, sys.nvarchar, sys.nvarchar) to public;
+
+-- FILESTREAM columns read as varbinary (with filestream-pathname.patch). Babelfish already accepts
+-- varbinary(max) FILESTREAM (escape_hatch_storage_options = 'ignore' keeps a plain varbinary(max) column) and
+-- drops ROWGUIDCOL (escape_hatch_rowguidcol_column = 'ignore'). Clients that check for FILESTREAM support
+-- before using such a column look in sys.filegroups (a type FD filegroup) and sys.database_files (a type 2
+-- file). sys.filegroups lists one after its stock rows; Babelfish's sys.database_files is empty (WHERE false),
+-- and lists that one file. The views belong to the extension: replaced in place,
+-- same columns and types. Every database then reports FILESTREAM; leave this block out if a client should
+-- not use FILESTREAM columns at all.
+create or replace view sys.filegroups as
+ select name, data_space_id, type collate sys.database_default as type, type_desc, is_default, is_system,
+   null::sys.uniqueidentifier as filegroup_guid, 0 as log_filegroup_id, 0::sys.bit as is_read_only,
+   0::sys.bit as is_autogrow_all_files
+ from sys.data_spaces ds where type = 'FG'::sys.bpchar
+ union all
+ select 'FILESTREAM'::sys.nvarchar(128), 2, ('FD'::sys.bpchar(2)) collate sys.database_default,
+   'FILESTREAM_DATA_FILEGROUP'::sys.nvarchar(60), 0::sys.bit, 0::sys.bit,
+   null::sys.uniqueidentifier, 0, 0::sys.bit, 0::sys.bit;
+grant select on sys.filegroups to public;
+
+create or replace view sys.database_files as
+ select 65537 as file_id, null::sys.uniqueidentifier as file_guid, 2::sys.tinyint as type,
+   'FILESTREAM'::sys.varchar::sys.nvarchar(60) as type_desc, 2 as data_space_id,
+   'FILESTREAM'::sys.varchar::sys.sysname as name, ''::sys.varchar::sys.nvarchar(260) as physical_name,
+   0::sys.tinyint as state, 'ONLINE'::sys.varchar::sys.nvarchar(60) as state_desc,
+   0 as size, -1 as max_size, 0 as growth, 0::sys.bit as is_media_read_only, 0::sys.bit as is_read_only,
+   0::sys.bit as is_sparse, 0::sys.bit as is_percent_growth, 0::sys.bit as is_name_reserved,
+   0::numeric(25,0) as create_lsn, 0::numeric(25,0) as drop_lsn, 0::numeric(25,0) as read_only_lsn,
+   0::numeric(25,0) as read_write_lsn, 0::numeric(25,0) as differential_base_lsn,
+   null::sys.uniqueidentifier as differential_base_guid, null::sys.datetime as differential_base_time,
+   0::numeric(25,0) as redo_start_lsn, null::sys.uniqueidentifier as redo_start_fork_guid,
+   0::numeric(25,0) as redo_target_lsn, null::sys.uniqueidentifier as redo_target_fork_guid,
+   0::numeric(25,0) as backup_lsn;
+grant select on sys.database_files to public;
+
+-- GET_FILESTREAM_TRANSACTION_CONTEXT(): the token for opening a FILESTREAM value as a file (SqlFileStream).
+-- There are no such files here, so there is no token: NULL, as SQL Server answers outside a transaction.
+create or replace function sys.get_filestream_transaction_context() returns sys.bbf_varbinary
+language plpgsql immutable as $$ begin return null; end $$;
+grant execute on function sys.get_filestream_transaction_context() to public;

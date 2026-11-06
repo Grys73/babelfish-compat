@@ -1,0 +1,50 @@
+babelfish-compat patch: see README
+--- a/contrib/babelfishpg_tsql/src/tsqlIface.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlIface.cpp
+@@ -856,6 +856,17 @@
+ ////////////////////////////////////////////////////////////////////////////////
+ // tsql Common Mutator
+ ////////////////////////////////////////////////////////////////////////////////
++/* FILESTREAM <column>.PathName(): is the would-be schema of the call a real schema? (see exitFunction_call) */
++static bool
++pathname_schema_exists(TSqlParser::Func_proc_name_server_database_schemaContext *fpnsds)
++{
++	std::string db = fpnsds->database ? stripQuoteFromId(fpnsds->database) : std::string(get_cur_db_name());
++	char *physical = get_physical_schema_name(pstrdup(db.c_str()), stripQuoteFromId(fpnsds->schema).c_str());
++	bool exists = physical && physical[0] && OidIsValid(get_namespace_oid(physical, true));
++	if (physical) pfree(physical);
++	return exists;
++}
++
+ class tsqlCommonMutator : public TSqlParserBaseListener
+ {
+ 	/* see comment above. */
+@@ -994,6 +1005,28 @@
+ 		handleGeospatialFunctionsInFunctionCall(ctx);
+ 		handleXMLFunctionsInFunctionCall(ctx);
+ 
++		/*
++		 * FILESTREAM: <column>.PathName() and <table>.<column>.PathName(). A FILESTREAM column is a plain
++		 * varbinary(max) here (escape_hatch_storage_options drops the option), so there is no file to name,
++		 * and the call parsed as function PathName of schema <column> ('schema "<column>" does not exist').
++		 * A client that reads the column itself and only takes the path along gets a constant path, NULL
++		 * for a NULL value as on SQL Server. Only a call without arguments named PathName, and only when
++		 * <column> is not a schema of the database (a real function dbo.PathName() stays a function call).
++		 */
++		if (ctx->func_proc_name_server_database_schema() && !ctx->function_arg_list() && !ctx->allOrDistinct)
++		{
++			auto fpnsds = ctx->func_proc_name_server_database_schema();
++			if (fpnsds->procedure && fpnsds->schema && !fpnsds->server && !fpnsds->colon_colon() &&
++				(fpnsds->DOT().size() == 1 || (fpnsds->DOT().size() == 2 && fpnsds->database && fpnsds->start == fpnsds->database->start)) &&
++				pg_strcasecmp(stripQuoteFromId(fpnsds->procedure).c_str(), "pathname") == 0 &&
++				!pathname_schema_exists(fpnsds))
++			{
++				std::string column = fpnsds->database ? ::getFullText(fpnsds->database) + "." + ::getFullText(fpnsds->schema) : ::getFullText(fpnsds->schema);
++				rewritten_query_fragment.emplace(std::make_pair(ctx->start->getStartIndex(), std::make_pair(::getFullText(ctx),
++					"(CASE WHEN " + column + " IS NULL THEN NULL ELSE CAST(N'\\\\BABELFISH\\FILESTREAM' AS sys.NVARCHAR(4000)) END)")));
++			}
++		}
++
+ 		if (ctx->func_proc_name_server_database_schema())
+ 		{
+ 			auto fpnsds = ctx->func_proc_name_server_database_schema();
