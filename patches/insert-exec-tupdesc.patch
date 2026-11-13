@@ -1,0 +1,31 @@
+--- a/src/backend/commands/functioncmds.c
++++ b/src/backend/commands/functioncmds.c
+@@ -2478,6 +2478,8 @@
+ 			TupleDescCopyEntry(retdesc, natts, reldesc, lfirst_int(list_cell));
+ 			next = lnext(stmt->attrnos, list_cell);
+ 		}
++		/* retdesc is a copy: unpin, as the DO path does (insert-exec-tupdesc patch) */
++		ReleaseTupleDesc(reldesc);
+ 
+ 		fcinfo->resultinfo = (Node *) &rsinfo;
+ 		rsinfo.type = T_ReturnSetInfo;
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -4205,7 +4205,17 @@
+ 
+ 		/* No more tuples to process? */
+ 		if (TupIsNull(context.planSlot))
++		{
++			/*
++			 * INSERT ... EXECUTE: the slot made above pins the target's
++			 * tupdesc; the drop below the switch is skipped by this break
++			 * ("resource was not closed: TupleDesc" at commit;
++			 * insert-exec-tupdesc patch).
++			 */
++			if (tsql_insert_exec)
++				ExecDropSingleTupleTableSlot(context.planSlot);
+ 			break;
++		}
+ 
+ 		/*
+ 		 * When there are multiple result relations, each tuple contains a
