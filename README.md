@@ -105,9 +105,9 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
   SQL Server.
 - `sys.langid()` (`@@langid`): the SQL Server langid of the session language, so data keyed by
   `@@langid` keeps working. One expression with no `FROM`, so the planner inlines it: a join or index
-  condition on `@@langid` reads a setting instead of calling a function per row. It reads
-  `babelfishpg_tsql.langid` (`session-langid.patch`), else maps `babelfishpg_tsql.language` with a
-  `CASE`.
+  condition on `@@langid` reads a setting instead of calling a function per row. With
+  `session-langid.patch` the body is only `current_setting('babelfishpg_tsql.langid')::smallint`;
+  without it (`init.sql` checks for the setting) a `CASE` maps `babelfishpg_tsql.language`.
 - T-SQL wrappers of `@@langid`: a scalar function whose whole body is `BEGIN RETURN @@langid END`
   (`smallint` or `int`, no parameters) is a pltsql function, which PostgreSQL never inlines, so a view
   joining on `langid = dbo.f()` called it once per row. The event trigger `bbf_compat_langid_inline`

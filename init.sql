@@ -30,14 +30,12 @@ grant execute on function sys.binary_checksum(sys.bbf_varbinary) to public;
 -- The session language is babelfishpg_tsql.language (session-language.patch stores it by name, like SQL
 -- Server's @@language); the number is SQL Server's langid, so data keyed by langid keeps working.
 -- One expression, no FROM: the planner inlines it, so  WHERE langid = @@langid  (or a view joining on it)
--- costs a GUC read per evaluation, not a function call. With langid-guc.patch the number is kept in the
--- session (babelfishpg_tsql.langid, set together with the language); without it the CASE maps the name.
--- current_setting(..., true): the setting is missing without the patch. Written so that it parses in both
--- dialects: an inlined sql body is parsed in the caller's dialect.
+-- costs a GUC read per evaluation, not a function call. With session-langid.patch the number is kept in
+-- the session (babelfishpg_tsql.langid, set together with the language) and the body only reads it;
+-- without the patch (no such setting) a CASE maps the name. Both bodies parse in either dialect (an
+-- inlined sql body is parsed in the caller's dialect).
 create or replace function sys.langid() returns smallint
-language sql stable parallel safe as $$
-  select coalesce(nullif(current_setting('babelfishpg_tsql.langid', true), '')::smallint,
-    (case lower(current_setting('babelfishpg_tsql.language'))
+language sql stable parallel safe as $$ select (case lower(current_setting('babelfishpg_tsql.language'))
       when 'us_english' then 0 when 'deutsch' then 1 when 'français' then 2 when '日本語' then 3
       when 'dansk' then 4 when 'español' then 5 when 'italiano' then 6 when 'nederlands' then 7
       when 'norsk' then 8 when 'português' then 9 when 'suomi' then 10 when 'svenska' then 11
@@ -46,8 +44,14 @@ language sql stable parallel safe as $$
       when 'български' then 20 when 'русский' then 21 when 'türkçe' then 22 when 'british' then 23
       when 'eesti' then 24 when 'latviešu' then 25 when 'lietuvių' then 26 when 'português (brasil)' then 27
       when '繁體中文' then 28 when '한국어' then 29 when '简体中文' then 30 when 'arabic' then 31
-      when 'ไทย' then 32 when 'norsk (bokmål)' then 33 else 0 end)::smallint)
-$$;
+      when 'ไทย' then 32 when 'norsk (bokmål)' then 33 else 0 end)::smallint $$;
+do $$
+begin
+  if current_setting('babelfishpg_tsql.langid', true) is not null then
+    create or replace function sys.langid() returns smallint
+    language sql stable parallel safe as 'select current_setting(''babelfishpg_tsql.langid'')::smallint';
+  end if;
+end $$;
 grant execute on function sys.langid() to public;
 
 -- T-SQL wrappers of @@langid. A T-SQL scalar function  RETURNS smallint|int AS BEGIN RETURN @@langid END  is
@@ -58,9 +62,15 @@ grant execute on function sys.langid() to public;
 -- and sp_helptext show what the client sent, and ALTER / DROP FUNCTION from T-SQL work as before (an ALTER
 -- with another body stays pltsql). The original pg_proc values are kept in sys.bbf_compat_langid_inlined
 -- (rollback). A failure is logged and never fails the CREATE.
+-- EXECUTE is granted to PUBLIC on each converted function (it returns only the session language). The
+-- planner inlines a SQL function only when the calling user may execute it, and a view's functions are
+-- checked against the user of the view, not its owner: a dealer database whose views read a producer
+-- database's views called the producer's function per row, and parallel workers failed with
+-- "permission denied for function". The ACL before the grant is kept in the table too.
 create table if not exists sys.bbf_compat_langid_inlined (
   fn oid primary key, nspname name, proname name, prolang oid, prosrc text, probin text,
   provolatile "char", proparallel "char", inlined_at timestamptz not null default now());
+alter table sys.bbf_compat_langid_inlined add column if not exists proacl aclitem[];
 
 create or replace function sys.bbf_compat_langid_inline(f oid) returns boolean
 language plpgsql security definer set search_path = pg_catalog as $$
@@ -68,7 +78,7 @@ declare p record;
 declare body text;
 begin
   select pr.oid, pr.pronamespace::regnamespace::name as nsp, pr.proname, pr.prolang, pr.prosrc, pr.probin,
-         pr.provolatile, pr.proparallel, pr.prorettype
+         pr.provolatile, pr.proparallel, pr.prorettype, pr.proacl
     into p
     from pg_proc pr join pg_language l on l.oid = pr.prolang
    where pr.oid = f and l.lanname = 'pltsql' and pr.prokind = 'f' and pr.pronargs = 0 and not pr.proretset
@@ -78,17 +88,19 @@ begin
   delete from sys.bbf_compat_langid_inlined i where not exists (select 1 from pg_proc x where x.oid = i.fn);
   body := case when p.prorettype = 'int2'::regtype then 'select sys.langid()'
                else 'select cast(sys.langid() as integer)' end;
-  insert into sys.bbf_compat_langid_inlined (fn, nspname, proname, prolang, prosrc, probin, provolatile, proparallel)
-    values (p.oid, p.nsp, p.proname, p.prolang, p.prosrc, p.probin, p.provolatile, p.proparallel)
+  insert into sys.bbf_compat_langid_inlined (fn, nspname, proname, prolang, prosrc, probin, provolatile, proparallel, proacl)
+    values (p.oid, p.nsp, p.proname, p.prolang, p.prosrc, p.probin, p.provolatile, p.proparallel, p.proacl)
     on conflict (fn) do update set nspname = excluded.nspname, proname = excluded.proname,
       prolang = excluded.prolang, prosrc = excluded.prosrc, probin = excluded.probin,
-      provolatile = excluded.provolatile, proparallel = excluded.proparallel, inlined_at = now();
+      provolatile = excluded.provolatile, proparallel = excluded.proparallel, proacl = excluded.proacl,
+      inlined_at = now();
   update pg_proc set prolang = (select oid from pg_language where lanname = 'sql'), prosrc = body,
          probin = null, provolatile = 's', proparallel = 's'
    where oid = p.oid;
   -- sql is a pinned language (no pg_depend row); drop the row that pointed at pltsql
   delete from pg_depend where classid = 'pg_proc'::regclass and objid = p.oid
      and refclassid = 'pg_language'::regclass and refobjid = p.prolang;
+  execute format('grant execute on function %s to public', p.oid::regprocedure);
   return true;
 end $$;
 revoke all on function sys.bbf_compat_langid_inline(oid) from public;
