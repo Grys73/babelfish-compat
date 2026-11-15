@@ -127,6 +127,10 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
   reports FILESTREAM: leave this block out if no client should use FILESTREAM columns. The column itself
   needs no patch: `escape_hatch_storage_options` and `escape_hatch_rowguidcol_column` (both `'ignore'` in
   `start.sh`) keep it as `varbinary(max)` and drop `ROWGUIDCOL`; `NEWSEQUENTIALID()` works as its default.
+- `sp_tablecollations_100` (SqlBulkCopy calls it once per destination table): the stock procedure filters
+  `sys.spt_tablecollations_view` on `oid::integer`, so every call evaluated `sys.all_columns` for all
+  databases (~15-20 ms). It now reads `sys.wh_spt_tablecollations_view` (same filters and expressions, raw
+  oid) by index (~1 ms). Output identical (606 objects, 10207 columns compared over TDS).
 
 None of these is `SECURITY DEFINER`.
 

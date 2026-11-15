@@ -244,3 +244,47 @@ BEGIN
 END;
 $procedure$;
 grant execute on procedure sys.bbf_compat_insert_exec(sys.nvarchar) to public;
+
+-- sp_tablecollations_100 (SqlBulkCopy runs it once per destination table before every bulk load). The stock
+-- procedure reads sys.spt_tablecollations_view, whose object_id is pg_class.oid::integer, so its
+-- "object_id = OBJECT_ID(@object)" cannot use the catalog indexes: every call builds sys.all_columns (type
+-- helpers, defaults, check constraints, privilege checks) for every column of every table in every database
+-- and keeps one table (~15-20 ms per call with a dozen databases). This view has the same filters and
+-- expressions for the four columns the procedure returns, plus the raw oid, so the lookup is an index scan
+-- (~1 ms). Same result rows, column types and order; the stock view is left as it is.
+create or replace view sys.wh_spt_tablecollations_view as
+select a.attrelid as relid,
+       a.attnum::integer as colid,
+       a.attname::sys.sysname::sys."varchar" as name,
+       sys.collationproperty(coll.collname::sys.sysname::text, 'tdscollation'::text)::sys."binary"(5) as tds_collation_100,
+       coll.collname::sys.sysname::sys.nvarchar(128) as collation_100
+  from pg_catalog.pg_attribute a
+  join pg_catalog.pg_class c on c.oid = a.attrelid
+  join pg_catalog.pg_namespace s on s.oid = c.relnamespace
+  left join sys.babelfish_namespace_ext ext on s.nspname = ext.nspname and ext.dbid = sys.db_id()
+  left join pg_catalog.pg_collation coll on coll.oid = a.attcollation
+ where not a.attisdropped
+   and (s.nspname = 'sys'::name or ext.nspname is not null)
+   and c.relkind = any (array['r'::"char", 'v'::"char", 'm'::"char", 'f'::"char", 'p'::"char"])
+   and c.relispartition = false
+   and has_column_privilege((quote_ident(s.nspname::text) || '.'::text) || quote_ident(c.relname::text), a.attname::text, 'SELECT,INSERT,UPDATE,REFERENCES'::text)
+   and a.attnum > 0;
+grant select on sys.wh_spt_tablecollations_view to public;
+-- The stock body with only the view and the filter column changed. A view, not a table-valued function: a
+-- function call in a pltsql body's FROM is parsed as a relation name.
+CREATE OR REPLACE PROCEDURE sys.sp_tablecollations_100(IN "@object" sys.nvarchar)
+ LANGUAGE pltsql
+AS '{"version_num": "1", "typmod_array": ["4000"], "original_probin": ""}', $procedure$
+BEGIN
+    select
+        s_tcv.colid AS colid,
+        s_tcv.name AS name,
+        s_tcv.tds_collation_100 AS tds_collation,
+        s_tcv.collation_100 AS collation
+    from
+        sys.wh_spt_tablecollations_view s_tcv
+    where
+        s_tcv.relid = (SELECT sys.object_id(@object))
+    order by colid;
+END;
+$procedure$;
