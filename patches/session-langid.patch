@@ -1,0 +1,72 @@
+--- a/contrib/babelfishpg_tsql/src/guc.c
++++ b/contrib/babelfishpg_tsql/src/guc.c
+@@ -45,6 +45,7 @@
+ int			pltsql_datefirst = 7;
+ int			pltsql_rowcount = 0;
+ char	   *pltsql_language = NULL;
++int			pltsql_langid = 0;	/* babelfish-compat patch: session-langid */
+ char	   *pltsql_psql_logical_babelfish_db_name = NULL;
+ int			pltsql_lock_timeout = -1;
+ bool		pltsql_enable_linked_servers = true;
+@@ -683,6 +684,33 @@
+ 		(*pltsql_protocol_plugin_ptr)->set_guc_stat_var("babelfishpg_tsql.datefirst", false, NULL, newval);
+ }
+ 
++/*
++ * babelfish-compat patch: session-langid. @@langid as a number kept in the
++ * session: babelfishpg_tsql.langid (read only) is SQL Server's langid of the
++ * session language. It is set wherever the language is (login language, SET
++ * LANGUAGE, connection reset, the rollback of a SET), so sys.langid() only
++ * reads it and stays a single inlinable expression. The index in
++ * sqlserver_languages (session-language.patch) is the langid; check_language
++ * has made the name canonical already. A name not listed counts as us_english.
++ */
++static void
++assign_language_langid(const char *newval, void *extra)
++{
++	int			langid = 0;
++
++	for (int i = 0; newval != NULL && i < lengthof(sqlserver_languages); i++)
++	{
++		if (pg_strcasecmp(newval, sqlserver_languages[i].name) == 0 ||
++			pg_strcasecmp(newval, sqlserver_languages[i].alias) == 0)
++		{
++			langid = i;
++			break;
++		}
++	}
++	pltsql_langid = langid;
++	assign_language(newval, extra);
++}
++
+ void
+ 			define_escape_hatch_variables(void);
+ 
+@@ -945,13 +973,26 @@
+ 							   GUC_NOT_IN_SAMPLE,
+ 							   check_tsql_version, NULL, NULL);
+ 
++	/*
++	 * babelfish-compat patch: session-langid. Defined before the language,
++	 * whose assign hook sets it (defining it resets it to the boot value).
++	 */
++	DefineCustomIntVariable("babelfishpg_tsql.langid",
++							gettext_noop("SQL Server langid of the session language (@@langid)."),
++							NULL,
++							&pltsql_langid,
++							0, 0, SHRT_MAX,
++							PGC_INTERNAL,
++							GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE | GUC_DISALLOW_IN_AUTO_FILE,
++							NULL, NULL, NULL);
++
+ 	DefineCustomStringVariable("babelfishpg_tsql.language",
+ 							   gettext_noop("T-SQL compatibility LANGUAGE option."),
+ 							   NULL,
+ 							   &pltsql_language,
+ 							   "us_english",	/* TODO correct boot value? */
+ 							   PGC_USERSET, 0,
+-							   check_language, assign_language, NULL);
++							   check_language, assign_language_langid, NULL);
+ 
+ 	DefineCustomBoolVariable("babelfishpg_tsql.xact_abort",
+ 							 gettext_noop("enable xact abort"),

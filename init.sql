@@ -29,46 +29,92 @@ grant execute on function sys.binary_checksum(sys.bbf_varbinary) to public;
 -- @@langid. Babelfish has no sys.langid(), and its sys.syslanguages lists locales, not SQL Server languages.
 -- The session language is babelfishpg_tsql.language (session-language.patch stores it by name, like SQL
 -- Server's @@language); the number is SQL Server's langid, so data keyed by langid keeps working.
+-- One expression, no FROM: the planner inlines it, so  WHERE langid = @@langid  (or a view joining on it)
+-- costs a GUC read per evaluation, not a function call. With langid-guc.patch the number is kept in the
+-- session (babelfishpg_tsql.langid, set together with the language); without it the CASE maps the name.
+-- current_setting(..., true): the setting is missing without the patch. Written so that it parses in both
+-- dialects: an inlined sql body is parsed in the caller's dialect.
 create or replace function sys.langid() returns smallint
 language sql stable parallel safe as $$
-  select coalesce((select l.id from (values
-    (0, 'us_english'),
-    (1, 'deutsch'),
-    (2, 'français'),
-    (3, '日本語'),
-    (4, 'dansk'),
-    (5, 'español'),
-    (6, 'italiano'),
-    (7, 'nederlands'),
-    (8, 'norsk'),
-    (9, 'português'),
-    (10, 'suomi'),
-    (11, 'svenska'),
-    (12, 'čeština'),
-    (13, 'magyar'),
-    (14, 'polski'),
-    (15, 'română'),
-    (16, 'hrvatski'),
-    (17, 'slovenčina'),
-    (18, 'slovenski'),
-    (19, 'ελληνικά'),
-    (20, 'български'),
-    (21, 'русский'),
-    (22, 'türkçe'),
-    (23, 'british'),
-    (24, 'eesti'),
-    (25, 'latviešu'),
-    (26, 'lietuvių'),
-    (27, 'português (brasil)'),
-    (28, '繁體中文'),
-    (29, '한국어'),
-    (30, '简体中文'),
-    (31, 'arabic'),
-    (32, 'ไทย'),
-    (33, 'norsk (bokmål)')
-  ) as l(id, name) where l.name = lower(current_setting('babelfishpg_tsql.language'))), 0)::smallint
+  select coalesce(nullif(current_setting('babelfishpg_tsql.langid', true), '')::smallint,
+    (case lower(current_setting('babelfishpg_tsql.language'))
+      when 'us_english' then 0 when 'deutsch' then 1 when 'français' then 2 when '日本語' then 3
+      when 'dansk' then 4 when 'español' then 5 when 'italiano' then 6 when 'nederlands' then 7
+      when 'norsk' then 8 when 'português' then 9 when 'suomi' then 10 when 'svenska' then 11
+      when 'čeština' then 12 when 'magyar' then 13 when 'polski' then 14 when 'română' then 15
+      when 'hrvatski' then 16 when 'slovenčina' then 17 when 'slovenski' then 18 when 'ελληνικά' then 19
+      when 'български' then 20 when 'русский' then 21 when 'türkçe' then 22 when 'british' then 23
+      when 'eesti' then 24 when 'latviešu' then 25 when 'lietuvių' then 26 when 'português (brasil)' then 27
+      when '繁體中文' then 28 when '한국어' then 29 when '简体中文' then 30 when 'arabic' then 31
+      when 'ไทย' then 32 when 'norsk (bokmål)' then 33 else 0 end)::smallint)
 $$;
 grant execute on function sys.langid() to public;
+
+-- T-SQL wrappers of @@langid. A T-SQL scalar function  RETURNS smallint|int AS BEGIN RETURN @@langid END  is
+-- a pltsql function, which the planner never inlines: in a join on  langid = dbo.f()  it is called once per
+-- row. An event trigger turns every such function, when it is created or altered, into a sql function
+-- with the body  select sys.langid()  (inlined like sys.langid itself). Only pg_proc is changed (language,
+-- body, PARALLEL SAFE); babelfish_function_ext keeps the T-SQL text, so OBJECT_DEFINITION, sys.sql_modules
+-- and sp_helptext show what the client sent, and ALTER / DROP FUNCTION from T-SQL work as before (an ALTER
+-- with another body stays pltsql). The original pg_proc values are kept in sys.bbf_compat_langid_inlined
+-- (rollback). A failure is logged and never fails the CREATE.
+create table if not exists sys.bbf_compat_langid_inlined (
+  fn oid primary key, nspname name, proname name, prolang oid, prosrc text, probin text,
+  provolatile "char", proparallel "char", inlined_at timestamptz not null default now());
+
+create or replace function sys.bbf_compat_langid_inline(f oid) returns boolean
+language plpgsql security definer set search_path = pg_catalog as $$
+declare p record;
+declare body text;
+begin
+  select pr.oid, pr.pronamespace::regnamespace::name as nsp, pr.proname, pr.prolang, pr.prosrc, pr.probin,
+         pr.provolatile, pr.proparallel, pr.prorettype
+    into p
+    from pg_proc pr join pg_language l on l.oid = pr.prolang
+   where pr.oid = f and l.lanname = 'pltsql' and pr.prokind = 'f' and pr.pronargs = 0 and not pr.proretset
+     and not pr.prosecdef and pr.proconfig is null and pr.prorettype in ('int2'::regtype, 'int4'::regtype)
+     and pr.prosrc ~* '^\s*begin\s+return\s*(@@langid|\(\s*@@langid\s*\))\s*;?\s*end\s*;?\s*$';
+  if not found then return false; end if;
+  delete from sys.bbf_compat_langid_inlined i where not exists (select 1 from pg_proc x where x.oid = i.fn);
+  body := case when p.prorettype = 'int2'::regtype then 'select sys.langid()'
+               else 'select cast(sys.langid() as integer)' end;
+  insert into sys.bbf_compat_langid_inlined (fn, nspname, proname, prolang, prosrc, probin, provolatile, proparallel)
+    values (p.oid, p.nsp, p.proname, p.prolang, p.prosrc, p.probin, p.provolatile, p.proparallel)
+    on conflict (fn) do update set nspname = excluded.nspname, proname = excluded.proname,
+      prolang = excluded.prolang, prosrc = excluded.prosrc, probin = excluded.probin,
+      provolatile = excluded.provolatile, proparallel = excluded.proparallel, inlined_at = now();
+  update pg_proc set prolang = (select oid from pg_language where lanname = 'sql'), prosrc = body,
+         probin = null, provolatile = 's', proparallel = 's'
+   where oid = p.oid;
+  -- sql is a pinned language (no pg_depend row); drop the row that pointed at pltsql
+  delete from pg_depend where classid = 'pg_proc'::regclass and objid = p.oid
+     and refclassid = 'pg_language'::regclass and refobjid = p.prolang;
+  return true;
+end $$;
+revoke all on function sys.bbf_compat_langid_inline(oid) from public;
+
+create or replace function sys.bbf_compat_langid_inline_trg() returns event_trigger
+language plpgsql security definer set search_path = pg_catalog as $$
+declare r record;
+begin
+  for r in select distinct c.objid from pg_event_trigger_ddl_commands() c where c.classid = 'pg_proc'::regclass loop
+    begin
+      perform sys.bbf_compat_langid_inline(r.objid);
+    exception when others then
+      raise log 'bbf_compat_langid_inline(%): %', r.objid, sqlerrm;
+    end;
+  end loop;
+end $$;
+revoke all on function sys.bbf_compat_langid_inline_trg() from public;
+
+drop event trigger if exists bbf_compat_langid_inline;
+create event trigger bbf_compat_langid_inline on ddl_command_end
+  when tag in ('CREATE FUNCTION', 'ALTER FUNCTION')
+  execute function sys.bbf_compat_langid_inline_trg();
+
+-- functions that exist already (a restored or converted database)
+select count(*) filter (where sys.bbf_compat_langid_inline(p.oid)) as langid_functions_inlined
+  from pg_proc p join pg_language l on l.oid = p.prolang where l.lanname = 'pltsql' and p.pronargs = 0;
 
 -- sp_rename without @objtype. SQL Server then works out what the name is (an object, else table.column,
 -- else table.index, else a user-defined type); Babelfish threw "Please provide @objtype" (EF Core's

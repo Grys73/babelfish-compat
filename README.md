@@ -60,6 +60,7 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
 | `empty-lob-not-null.patch` | tdsbulkload.c | A bulk load stored an empty `text` / `ntext` / `image` value as NULL. TDS marks NULL for these types with a zero-length text pointer; the code also treated a value of length 0 as NULL. |
 | `session-language.patch` | gram-tsql-rule.y, guc.c | `SET LANGUAGE` and the login language always ended on `us_english`. The SQL Server languages (by name or alias) are now kept as the session language, so `@@langid` (`sys.langid()` in `init.sql`) and the `babelfishpg_tsql.language` setting follow `SET LANGUAGE`, and applications that select data by language see it. `@@language` itself still returns `us_english`. Dates and messages stay `us_english`. |
 | `language-default.patch` | guc.c | A server default language (`babelfishpg_tsql.language` in `postgresql.conf` or `ALTER SYSTEM`) crashed backends on start and on a configuration reload: the assign hook sent the change to the client through the protocol plugin also where there is no request. Now only inside a transaction. A connection without a login language then gets the server default, as on SQL Server. |
+| `session-langid.patch` | guc.c | `@@langid` as a number kept in the session: `babelfishpg_tsql.langid` (read only) is the SQL Server langid of the session language, set by the language assign hook (login language, `SET LANGUAGE`, connection reset), so `sys.langid()` only reads it. Uses the language table of `session-language.patch`. Without this patch `sys.langid()` maps the language name itself. |
 | `udt-arg-quote.patch` | hooks.c | Scalar functions with user-defined-type arguments failed to create in databases whose name needs quoting (e.g. starts with a digit): the schema name was put bare into a re-parsed GRANT list. |
 | `xml-strip-bom.patch` | PostgreSQL xml.c, tdstypeio.c | SQL Server never stores or returns a byte order mark in an `xml` value; Babelfish kept a leading U+FEFF. SqlClient sends every `xml` parameter and bulk value as UTF-16 with FF FE, so every .NET write stored one, and `XDocument.Parse` then failed on read. Stripped on input and on output (output also covers values stored earlier). |
 | `applock-per-database.patch` | applock.c | `sp_getapplock` locks belong to a database on SQL Server, but all Babelfish databases share one Postgres database, so two databases taking the same resource name blocked each other. The resource is now prefixed with the T-SQL database id. `@LockTimeout = 0` returns -1 when the lock is taken, as on SQL Server. |
@@ -103,7 +104,19 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
   differ from SQL Server's**; use it for change detection, not to compare with checksums computed on
   SQL Server.
 - `sys.langid()` (`@@langid`): the SQL Server langid of the session language, so data keyed by
-  `@@langid` keeps working.
+  `@@langid` keeps working. One expression with no `FROM`, so the planner inlines it: a join or index
+  condition on `@@langid` reads a setting instead of calling a function per row. It reads
+  `babelfishpg_tsql.langid` (`session-langid.patch`), else maps `babelfishpg_tsql.language` with a
+  `CASE`.
+- T-SQL wrappers of `@@langid`: a scalar function whose whole body is `BEGIN RETURN @@langid END`
+  (`smallint` or `int`, no parameters) is a pltsql function, which PostgreSQL never inlines, so a view
+  joining on `langid = dbo.f()` called it once per row. The event trigger `bbf_compat_langid_inline`
+  (on `CREATE` / `ALTER FUNCTION`) turns every such function into a SQL function `select sys.langid()`;
+  `init.sql` also converts the ones that exist already. Only `pg_proc` changes: `OBJECT_DEFINITION`,
+  `sys.sql_modules` and `sys.objects` (`FN`) still show the T-SQL function, and `DROP FUNCTION` and
+  `CREATE FUNCTION` work as before. The original `pg_proc` values are kept in
+  `sys.bbf_compat_langid_inlined`. Known gap: `ALTER FUNCTION` on a converted function fails ("No
+  existing TSQL procedure found"; Babelfish accepts only pltsql functions there): drop and create it.
 - `sp_rename` without `@objtype`: SQL Server's inference (an object, else `table.column`, else
   `table.index`, else a user-defined type, else "No item by the given @objname could be found") is put in
   front of the stock procedure's body; it only looks the name up (no dynamic SQL). EF Core's RenameTable
