@@ -115,7 +115,12 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
   `init.sql` also converts the ones that exist already. Only `pg_proc` changes: `OBJECT_DEFINITION`,
   `sys.sql_modules` and `sys.objects` (`FN`) still show the T-SQL function, and `DROP FUNCTION` and
   `CREATE FUNCTION` work as before. The original `pg_proc` values are kept in
-  `sys.bbf_compat_langid_inlined`. Known gap: `ALTER FUNCTION` on a converted function fails ("No
+  `sys.bbf_compat_langid_inlined`. The trigger also grants `EXECUTE` on each converted function to
+  `PUBLIC` (it returns only the session language; the old ACL is kept in the table). PostgreSQL
+  inlines a SQL function only for a user who may execute it, and checks a view's functions against
+  the user of the view, not its owner. So a database whose views read another database's views
+  called that database's function per row, and parallel workers failed with "permission denied for
+  function". Known gap: `ALTER FUNCTION` on a converted function fails ("No
   existing TSQL procedure found"; Babelfish accepts only pltsql functions there): drop and create it.
 - `sp_rename` without `@objtype`: SQL Server's inference (an object, else `table.column`, else
   `table.index`, else a user-defined type, else "No item by the given @objname could be found") is put in
