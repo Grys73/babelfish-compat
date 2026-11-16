@@ -310,7 +310,7 @@ grant execute on procedure sys.bbf_compat_insert_exec(sys.nvarchar) to public;
 -- and keeps one table (~15-20 ms per call with a dozen databases). This view has the same filters and
 -- expressions for the four columns the procedure returns, plus the raw oid, so the lookup is an index scan
 -- (~1 ms). Same result rows, column types and order; the stock view is left as it is.
-create or replace view sys.wh_spt_tablecollations_view as
+create or replace view sys.bbf_compat_spt_tablecollations_view as
 select a.attrelid as relid,
        a.attnum::integer as colid,
        a.attname::sys.sysname::sys."varchar" as name,
@@ -327,7 +327,7 @@ select a.attrelid as relid,
    and c.relispartition = false
    and has_column_privilege((quote_ident(s.nspname::text) || '.'::text) || quote_ident(c.relname::text), a.attname::text, 'SELECT,INSERT,UPDATE,REFERENCES'::text)
    and a.attnum > 0;
-grant select on sys.wh_spt_tablecollations_view to public;
+grant select on sys.bbf_compat_spt_tablecollations_view to public;
 -- The stock body with only the view and the filter column changed. A view, not a table-valued function: a
 -- function call in a pltsql body's FROM is parsed as a relation name.
 CREATE OR REPLACE PROCEDURE sys.sp_tablecollations_100(IN "@object" sys.nvarchar)
@@ -340,7 +340,7 @@ BEGIN
         s_tcv.tds_collation_100 AS tds_collation,
         s_tcv.collation_100 AS collation
     from
-        sys.wh_spt_tablecollations_view s_tcv
+        sys.bbf_compat_spt_tablecollations_view s_tcv
     where
         s_tcv.relid = (SELECT sys.object_id(@object))
     order by colid;
