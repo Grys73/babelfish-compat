@@ -251,7 +251,15 @@ babelfish-compat patch: see README
  		TdsErrorContext->err_text = "Parsing PreLogin Request";
 --- a/contrib/babelfishpg_tds/src/backend/tds/tdssecure.c
 +++ b/contrib/babelfishpg_tds/src/backend/tds/tdssecure.c
-@@ -40,6 +40,8 @@
+@@ -34,12 +34,16 @@
+ #include "utils/memutils.h"
+ #include "storage/ipc.h"
+ #include "storage/proc.h"
++#include "storage/latch.h"
++#include "utils/wait_event.h"
+ 
+ #include "src/include/tds_secure.h"
+ #include "src/include/tds_int.h"
  
  int			tds_ssl_min_protocol_version = PG_TLS1_VERSION;
  int			tds_ssl_max_protocol_version = PG_TLS1_2_VERSION;
@@ -260,8 +268,245 @@ babelfish-compat patch: see README
  #ifdef USE_SSL
  
  /*
-@@ -313,6 +315,19 @@ TdsBioSecureSocket(BIO_METHOD * my_bio_methods)
+@@ -62,6 +66,18 @@
+ static TDSPacketHeader pkt_data = {0};
+ 
+ /*
++ * TLS bytes written during the PRELOGIN-wrapped handshake and not sent yet
++ * (see SslHandShakeWrite).
++ */
++static char *hs_pending = NULL;
++static int	hs_pending_len = 0;
++static int	hs_pending_size = 0;
++static uint8_t hs_packet_id = 0;
++static long (*hs_socket_ctrl) (BIO *, int, long, void *) = NULL;
++
++static int	SslHandShakeFlush(BIO * h);
++
++/*
+  * SslRead - TDS secure read function, similar to my_sock_read
+  */
+ static int
+@@ -100,6 +116,9 @@
+ {
+ 	int res = 0;
+ 
++	if (hs_pending_len > 0 && SslHandShakeFlush(h) < 0)
++		return -1;
++
+ 	/*
+ 	 * Read the TDS header if not read.  It's possible that we're reading
+ 	 * the header in multiple iteration.
+@@ -191,80 +210,121 @@
+ }
+ 
+ /*
+- * TdsSshHandShakeWrite - Tds secure write function, similar to my_sock_write.
+- * During the initial handshake add the 8 bytes header to the final data which
+- * is sent to client
++ * SslHandShakeSendPacket - sends one PRELOGIN packet carrying len bytes,
++ * waiting for the socket when it is full: a packet must not be cut short.
+  */
+ static int
+-SslHandShakeWrite(BIO * h, const char *buf, int size)
++SslHandShakeSendPacket(BIO * h, const char *data, int len, bool eom)
+ {
+-	StringInfoData	str;
+-	char		tmp[2];
+-	uint16_t	tsize;
+-	int		res = 0;
+-	int		total_written = 0;
+-	int		packet_id = 0;
++	char	   *pkt = palloc(len + TDS_PACKET_HEADER_SIZE);
++	uint16_t	tsize = pg_hton16(len + TDS_PACKET_HEADER_SIZE);
++	int			sent = 0;
++	int			total = len + TDS_PACKET_HEADER_SIZE;
++
++	pkt[0] = TDS_PRELOGIN;
++	pkt[1] = eom ? TDS_PACKET_HEADER_STATUS_EOM : 0x00;
++	memcpy(&pkt[2], &tsize, 2);
++	pkt[4] = 0;
++	pkt[5] = 0;
++	pkt[6] = (char) hs_packet_id++;
++	pkt[7] = 0;
++	memcpy(pkt + TDS_PACKET_HEADER_SIZE, data, len);
+ 
+-	/*
+-	 * No data to write — uncommon during TLS handshake as records carry data.
+-	 * In BIO-based writes (e.g. BIO_write_all), size <= 0 will raise an error.
+-	 * Return early to avoid sending an empty or invalid TDS packet.
+-	 */
+-	if (size <= 0)
+-		return size;
++	while (sent < total)
++	{
++		int			n = SslWrite(h, pkt + sent, total - sent);
+ 
+-	/* Process data in chunks of TDS_DEFAULT_INIT_PACKET_SIZE */
+-	while (size > 0)
++		if (n > 0)
++		{
++			sent += n;
++			continue;
++		}
++		if (n < 0 && (errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN))
++		{
++			BIO_clear_retry_flags(h);
++			(void) WaitLatchOrSocket(MyLatch,
++									 WL_SOCKET_WRITEABLE | WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
++									 ((Port *) BIO_get_app_data(h))->sock, -1,
++									 WAIT_EVENT_CLIENT_WRITE);
++			ResetLatch(MyLatch);
++			CHECK_FOR_INTERRUPTS();
++			continue;
++		}
++		pfree(pkt);
++		return -1;
++	}
++	pfree(pkt);
++	return 0;
++}
++
++/*
++ * SslHandShakeFlush - sends what the handshake wrote since the last flush as
++ * one TDS message: PRELOGIN packets of up to TDS_DEFAULT_INIT_PACKET_SIZE
++ * bytes, EOM on the last.
++ */
++static int
++SslHandShakeFlush(BIO * h)
++{
++	const int	maxp = TDS_DEFAULT_INIT_PACKET_SIZE - TDS_PACKET_HEADER_SIZE;
++	int			off = 0;
++
++	while (off < hs_pending_len)
+ 	{
+-		int chunk_size = (size > (TDS_DEFAULT_INIT_PACKET_SIZE - TDS_PACKET_HEADER_SIZE)) ?
+-							(TDS_DEFAULT_INIT_PACKET_SIZE - TDS_PACKET_HEADER_SIZE) :
+-							size;
+-
+-		initStringInfo(&str);
+-		appendStringInfoChar(&str, TDS_PRELOGIN);
+-
+-		/* Set EOM flag only for the last packet */
+-		if (size <= (TDS_DEFAULT_INIT_PACKET_SIZE - TDS_PACKET_HEADER_SIZE))
+-			appendStringInfoChar(&str, TDS_PACKET_HEADER_STATUS_EOM);
+-		else
+-			appendStringInfoChar(&str, 0x00);  // Not end of message
+-
+-		tsize = pg_hton16(chunk_size + TDS_PACKET_HEADER_SIZE);
+-		memcpy(&tmp, (char *) &tsize, 2);
+-
+-		appendStringInfoChar(&str, tmp[0]);
+-		appendStringInfoChar(&str, tmp[1]);
+-		appendStringInfoChar(&str, 0x00);
+-		appendStringInfoChar(&str, 0x00);
+-		appendStringInfoChar(&str, packet_id++);
+-		appendStringInfoChar(&str, 0x00);
+-
+-		appendBinaryStringInfo(&str, buf + total_written, chunk_size);
+-
+-		/* Write the current chunk */
+-		res = 0;
+-		while (res < (chunk_size + TDS_PACKET_HEADER_SIZE))
++		int			n = Min(maxp, hs_pending_len - off);
++
++		if (SslHandShakeSendPacket(h, hs_pending + off, n, off + n == hs_pending_len) < 0)
+ 		{
+-			int tmp_res = SslWrite(h, str.data + res, (chunk_size + TDS_PACKET_HEADER_SIZE - res));
+-			if (tmp_res <= 0)
+-				return tmp_res;
+-			res += tmp_res;
++			hs_pending_len = 0;
++			return -1;
+ 		}
++		off += n;
++	}
++	hs_pending_len = 0;
++	return 0;
++}
++
++/*
++ * SslHandShakeWrite - TDS 7.x handshake write: TLS wrapped in PRELOGIN packets.
++ *
++ * The SChannel based client (native SNI: SqlClient, ODBC and OLE DB on
++ * Windows) expects each handshake flight of the server as one TDS message,
++ * as SQL Server sends it.  OpenSSL hands a flight over in several writes
++ * (its handshake buffer flushes when full, cutting a record), and each was
++ * sent as a message of its own: once the certificate chain outgrew one 4 KB
++ * packet the client failed with SEC_E_INCOMPLETE_MESSAGE or
++ * SEC_E_INVALID_TOKEN.  So writes are only collected here; OpenSSL flushes
++ * the BIO at the end of every flight (SslHandShakeCtrl), and that sends them.
++ */
++static int
++SslHandShakeWrite(BIO * h, const char *buf, int size)
++{
++	if (size <= 0)
++		return size;
+ 
+-		/*
+-		 * Below assertion should not be failed in ideal case. If it gets failed
+-		 * then it means that we wrote TDS HEADER and buf on the wire without any
+-		 * error above but number of bytes written is still less than
+-		 * TDS_PACKET_HEADER_SIZE which is unexpected in any case.
+-		 */
+-		Assert(res >= TDS_PACKET_HEADER_SIZE);
+-
+-		total_written += chunk_size;
+-		size -= chunk_size;
+-		pfree(str.data);
++	if (hs_pending_len + size > hs_pending_size)
++	{
++		int			newsize = Max(Max(hs_pending_size * 2, hs_pending_len + size), 16384);
++
++		hs_pending = hs_pending == NULL ?
++			MemoryContextAlloc(TopMemoryContext, newsize) :
++			repalloc(hs_pending, newsize);
++		hs_pending_size = newsize;
+ 	}
++	memcpy(hs_pending + hs_pending_len, buf, size);
++	hs_pending_len += size;
++	return size;
++}
+ 
+-	return total_written;
++/*
++ * SslHandShakeCtrl - the socket BIO's ctrl, but a flush sends the collected
++ * handshake flight.
++ */
++static long
++SslHandShakeCtrl(BIO * h, int cmd, long num, void *ptr)
++{
++	if (cmd == BIO_CTRL_FLUSH && hs_pending_len > 0 && SslHandShakeFlush(h) < 0)
++		return 0;
++	return hs_socket_ctrl(h, cmd, num, ptr);
+ }
+ 
+ /*
+@@ -277,6 +337,8 @@
+ {
+ 	/* reset the tds packet data state*/
+ 	pkt_bytes_read = 0;
++	hs_pending_len = 0;
++	hs_packet_id = 0;
+ 
+ 	if (my_bio_methods == NULL)
+ 	{
+@@ -295,7 +357,8 @@
+ 			!BIO_meth_set_read(my_bio_methods, SslHandShakeRead) ||
+ 			!BIO_meth_set_gets(my_bio_methods, BIO_meth_get_gets(biom)) ||
+ 			!BIO_meth_set_puts(my_bio_methods, BIO_meth_get_puts(biom)) ||
+-			!BIO_meth_set_ctrl(my_bio_methods, BIO_meth_get_ctrl(biom)) ||
++			!(hs_socket_ctrl = BIO_meth_get_ctrl(biom)) ||
++			!BIO_meth_set_ctrl(my_bio_methods, SslHandShakeCtrl) ||
+ 			!BIO_meth_set_create(my_bio_methods, BIO_meth_get_create(biom)) ||
+ 			!BIO_meth_set_destroy(my_bio_methods, BIO_meth_get_destroy(biom)) ||
+ 			!BIO_meth_set_callback_ctrl(my_bio_methods, BIO_meth_get_callback_ctrl(biom)))
+@@ -311,8 +374,23 @@
+ 		memcpy(my_bio_methods, biom, sizeof(BIO_METHOD));
+ 		my_bio_methods->bread = SslHandShakeRead;
  		my_bio_methods->bwrite = SslHandShakeWrite;
++		hs_socket_ctrl = biom->ctrl;
++		my_bio_methods->ctrl = SslHandShakeCtrl;
  #endif
  	}
 +
