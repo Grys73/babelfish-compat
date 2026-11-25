@@ -107,4 +107,21 @@ if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
 fi
 
 # Start postgres engine
-exec ./postgres -D ${BABELFISH_DATA}/ -i
+# Optional TLS (tds8-strict.patch): mount a server certificate and key at
+# /run/secrets/server.crt and /run/secrets/server.key (or set TLS_CERT/TLS_KEY).
+# Both ports then accept TLS; TDS clients can use Encrypt=Strict (TDS 8.0).
+# TDS_STRICT_ONLY=on closes TDS connections that do not start with TLS.
+TLS_CERT=${TLS_CERT:-/run/secrets/server.crt}
+TLS_KEY=${TLS_KEY:-/run/secrets/server.key}
+set --
+if [ -f "${TLS_CERT}" ] && [ -f "${TLS_KEY}" ]; then
+	# PostgreSQL refuses a key readable by others; mounted files often are
+	install -m 600 "${TLS_CERT}" ${BABELFISH_DATA}/server.crt
+	install -m 600 "${TLS_KEY}" ${BABELFISH_DATA}/server.key
+	set -- -c ssl=on -c ssl_cert_file=server.crt -c ssl_key_file=server.key
+	if [ "${TDS_STRICT_ONLY}" = "on" ]; then
+		set -- "$@" -c babelfishpg_tds.tds_ssl_strict_only=on
+	fi
+fi
+
+exec ./postgres -D ${BABELFISH_DATA}/ -i "$@"

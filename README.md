@@ -47,6 +47,27 @@ The first start also writes into `postgresql.conf`:
 
 and runs `init.sql` once (see below).
 
+### TLS and TDS 8.0 strict encryption
+
+Mount a server certificate and key at `/run/secrets/server.crt` and `/run/secrets/server.key` (or set
+`TLS_CERT` / `TLS_KEY`); `start.sh` then starts with `ssl=on`. Both ports accept TLS, and with
+`tds8-strict.patch` SqlClient can use `Encrypt=Strict` (TDS 8.0: TLS before any TDS byte, TLS 1.2 or
+1.3, ALPN `tds/8.0`). `-e TDS_STRICT_ONLY=on` refuses TDS clients that do not start with TLS.
+
+```
+tools/make-dev-certs.sh ./certs bbf.example.local 127.0.0.1   # throwaway CA + server cert, dev only
+docker run -d --name bbf -p 1433:1433 -v bbfdata:/var/lib/babelfish/data \
+  -v $PWD/certs/server.crt:/run/secrets/server.crt:ro -v $PWD/certs/server.key:/run/secrets/server.key:ro \
+  babelfish-compat -p <password>
+```
+
+The certificate's SAN must contain the name clients put in `Server=` (or in `HostNameInCertificate`), and
+`server.crt` should hold the full chain. Under `Encrypt=Strict` SqlClient always validates the
+certificate and ignores `TrustServerCertificate`: trust the issuing CA on the client, or pin the
+certificate with `ServerCertificate=<path to server.crt>` (a pinned certificate is compared byte for
+byte; SqlClient then does not check the host name). On Git Bash run the script with
+`MSYS_NO_PATHCONV=1` and a `C:/...` output path.
+
 The ANTLR / PostgreSQL / extension build steps come from
 [jonathanpotts/docker-babelfishpg](https://github.com/jonathanpotts/docker-babelfishpg). Nothing in
 the Dockerfile is amd64-specific; `docker buildx build --platform linux/arm64` works (slow under QEMU).
@@ -79,6 +100,8 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
 | `temp-owner.patch` | hooks.c | For a login that is a `db_owner` member but not `dbo`, Babelfish hands every object it creates to the database owner role (`REASSIGN OWNED`) right after creation. For a `#temp` table or a table variable with an `IDENTITY` column the identity sequence was created and reassigned first, while the table stayed with the user, so the statement failed with "sequence must have same owner as table it is linked to" (later "no owned sequence found"). Objects in a temporary namespace (`#temp` tables, table variables, their sequences and types) and column defaults and constraints are no longer reassigned; they are session-private and dropped with the session. Permanent objects are reassigned as before. |
 | `insert-exec-expr.patch` | gram-tsql-rule.y, gram-tsql-prologue.y.h, gram-tsql-epilogue.y.c | `INSERT ... EXEC (...)` took only a string literal: `INSERT INTO @t EXEC ('select ... from dbo.' + @tbl)` or `EXEC (@sql)` was a syntax error. A literal still runs as before; any other expression becomes a call of `sys.bbf_compat_insert_exec(@sql)` from `init.sql`, whose `EXEC (@sql)` hands its rows to the INSERT (needs `insert-exec-batch.patch`). Variables resolve like any procedure argument. |
 | `insert-exec-tupdesc.patch` | PostgreSQL nodeModifyTable.c, functioncmds.c | Every `INSERT ... EXECUTE` left the target table's row descriptor pinned, and the server logged `WARNING: resource was not closed: TupleDesc` at the end of the transaction (one per statement, two when the rows came through a procedure call, e.g. `EXEC (@sql)` with `insert-exec-expr.patch`). Clients that show server messages got the warning with every such batch. The results were right; only the reference was not released. The slot made for the rows is now dropped when the rows end, and the procedure-call path releases its row type as the `DO` path already did. |
+
+| `tds8-strict.patch` | tdslogin.c, tdssecure.c, tds-secure-openssl.c, guc.c, guc.h, tds_secure.h | TDS 8.0 strict encryption (`Encrypt=Strict`, SQL Server 2022): Babelfish only knew TDS 7.x, where TLS is wrapped in PRELOGIN packets. The listener now peeks at the first byte of a connection; a TLS ClientHello (0x16) starts TLS at once with raw TLS records, then PRELOGIN (answered with ENCRYPT_NOT_SUP, as the connection is already encrypted) and LOGIN7 run inside TLS. LOGIN7 version 8.0 is handled as 7.4. ALPN `tds/8.0` is negotiated, TLS 1.3 is allowed (`TLSv1.3` added to `babelfishpg_tds.tds_ssl_max_protocol_version`; strict connections are always capped at 1.3), TLS 1.3 session tickets are off (SqlClient's native SNI fails on them). New setting `babelfishpg_tds.tds_ssl_strict_only` (sighup, default off) refuses connections that do not start with TLS. Needs `ssl=on` with a certificate (see "TLS and TDS 8.0 strict encryption"); without one a TLS-first connection is closed. TDS 7.x clients (`Encrypt=Optional` / `Mandatory`) work as before. |
 
 ### MERGE limits
 
@@ -231,6 +254,17 @@ INSERT ... EXECUTE descriptor leak update (`insert-exec-tupdesc.patch`), on x64 
 - PostgreSQL `make check` 227/227, isolation 118/118.
 - Babelfish JDBC suite (3598 files, multi-db): the same 148 failing files as the previous build, none new.
 - Over TDS (sqlcmd), against the previous build: `INSERT ... EXEC` with a literal, an N-literal and a variable, into table variables and `#temp` tables, zero and 5000 rows, procedures with arguments and a column list, inside committed and rolled-back transactions, after an error caught by TRY / CATCH, and 200 times in a loop return the same results on both builds. The previous build logged 421 "resource was not closed" warnings for that script, this one none. A nested `INSERT ... EXEC` is still refused, as on SQL Server.
+
+TDS 8.0 strict update (`tds8-strict.patch`, `start.sh` TLS options), locally on x64 Docker Desktop
+(Windows client, Microsoft.Data.SqlClient 7.1.2, both native and managed SNI):
+
+- `Encrypt=Strict` with the server certificate pinned connects (`encrypt_option` TRUE); an untrusted
+  certificate, `TrustServerCertificate=true` under Strict, and pinning a different certificate are refused
+  by the client.
+- `Encrypt=Mandatory` and `Encrypt=Optional` (TDS 7.4) still connect; with `TDS_STRICT_ONLY=on` they are
+  refused and the server logs why.
+- `openssl s_client` and .NET `SslStream`: TLS 1.3 and 1.2 handshakes with ALPN `tds/8.0`.
+- Not run yet: the PostgreSQL and Babelfish JDBC suites with this patch.
 
 ## Licence
 

@@ -1,1 +1,6 @@
 *.log
+certs/
+bin/
+obj/
+*.pfx
+*.key

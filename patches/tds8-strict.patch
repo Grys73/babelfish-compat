@@ -1,0 +1,305 @@
+babelfish-compat patch: see README
+--- a/contrib/babelfishpg_tds/src/backend/tds/guc.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/guc.c
+@@ -36,6 +36,7 @@ char	   *default_server_name = NULL;
+ int			tds_default_numeric_precision = 38;
+ int			tds_default_numeric_scale = 8;
+ bool		tds_ssl_encrypt = false;
++bool		tds_ssl_strict_only = false;
+ int			tds_default_protocol_version = 0;
+ int32_t		tds_default_packet_size = 4096;
+ int			tds_debug_log_level = 1;
+@@ -51,6 +52,7 @@ const struct config_enum_entry ssl_protocol_versions_info[] = {
+ 	{"TLSv1", PG_TLS1_VERSION, false},
+ 	{"TLSv1.1", PG_TLS1_1_VERSION, false},
+ 	{"TLSv1.2", PG_TLS1_2_VERSION, false},
++	{"TLSv1.3", PG_TLS1_3_VERSION, false},
+ 	{NULL, 0, false}
+ };
+ 
+@@ -302,6 +304,17 @@ TdsDefineGucs(void)
+ 							 GUC_NOT_IN_SAMPLE,
+ 							 NULL, NULL, NULL);
+ 
++	DefineCustomBoolVariable(
++							 "babelfishpg_tds.tds_ssl_strict_only",
++							 gettext_noop("Accepts only TDS 8.0 strict (TLS-first) connections"),
++							 gettext_noop("When on, a connection that starts with a PRELOGIN packet "
++										  "instead of a TLS handshake is closed."),
++							 &tds_ssl_strict_only,
++							 false,
++							 PGC_SIGHUP,
++							 GUC_NOT_IN_SAMPLE,
++							 NULL, NULL, NULL);
++
+ 	DefineCustomEnumVariable(
+ 							 "babelfishpg_tds.tds_default_protocol_version",
+ 							 gettext_noop("Sets a default TDS protocol version for"
+--- a/contrib/babelfishpg_tds/src/backend/tds/tds-secure-openssl.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tds-secure-openssl.c
+@@ -64,6 +64,8 @@ static int	dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
+ #if 0
+ static int	verify_cb(int, X509_STORE_CTX *);
+ #endif
++static int	tds_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
++							   const unsigned char *in, unsigned int inlen, void *arg);
+ static void info_cb(const SSL * ssl, int type, int args);
+ static bool initialize_dh(SSL_CTX * context, bool isServerStart);
+ static bool initialize_ecdh(SSL_CTX * context, bool isServerStart);
+@@ -265,6 +267,18 @@ Tds_be_tls_init(bool isServerStart)
+ 
+ 	/* disallow SSL session tickets */
+ 	SSL_CTX_set_options(context, SSL_OP_NO_TICKET);
++#ifdef TLS1_3_VERSION
++
++	/*
++	 * TLS 1.3 sends tickets after the handshake even with SSL_OP_NO_TICKET
++	 * (stateful ones).  In the PRELOGIN-wrapped handshake they would cross
++	 * the switch to raw TLS records, so send none at all.
++	 */
++	SSL_CTX_set_num_tickets(context, 0);
++#endif
++
++	/* TDS 8.0 strict clients offer ALPN "tds/8.0" */
++	SSL_CTX_set_alpn_select_cb(context, tds_alpn_select_cb, NULL);
+ 
+ 	/* disallow SSL session caching, too */
+ 	SSL_CTX_set_session_cache_mode(context, SSL_SESS_CACHE_OFF);
+@@ -455,6 +469,22 @@ Tds_be_tls_open_server(Port *port)
+ 						SSLerrmessage(ERR_get_error()))));
+ 		return -1;
+ 	}
++#ifdef TLS1_3_VERSION
++
++	/*
++	 * TDS 8.0 strict connections may use TLS 1.3 whatever
++	 * tds_ssl_max_protocol_version says: that cap exists for the
++	 * PRELOGIN-wrapped handshake of TDS 7.x clients.
++	 */
++	if (TdsStrictHandshake && !SSL_set_max_proto_version(port->ssl, TLS1_3_VERSION))
++	{
++		ereport(COMMERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("could not allow TLS 1.3 for a TDS 8.0 strict connection: %s",
++						SSLerrmessage(ERR_get_error()))));
++		return -1;
++	}
++#endif
+ 	if (!my_SSL_set_fd(port, port->sock))
+ 	{
+ 		ereport(COMMERROR,
+@@ -1098,6 +1128,24 @@ dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata)
+ 	return 0;
+ }
+ 
++/*
++ * ALPN selection: a TDS 8.0 strict client offers "tds/8.0".  A strict client
++ * that offers only other protocols is refused; elsewhere ALPN is ignored.
++ */
++static int
++tds_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
++				   const unsigned char *in, unsigned int inlen, void *arg)
++{
++	static const unsigned char tds_alpn[] = "\x07tds/8.0";
++
++	if (SSL_select_next_proto((unsigned char **) out, outlen,
++							  tds_alpn, sizeof(tds_alpn) - 1,
++							  in, inlen) == OPENSSL_NPN_NEGOTIATED)
++		return SSL_TLSEXT_ERR_OK;
++
++	return TdsStrictHandshake ? SSL_TLSEXT_ERR_ALERT_FATAL : SSL_TLSEXT_ERR_NOACK;
++}
++
+ #if 0
+ /*
+  *	Certificate verification callback
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdslogin.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdslogin.c
+@@ -42,6 +42,8 @@
+ #include "miscadmin.h"
+ #include "replication/walsender.h"
+ #include "storage/ipc.h"
++#include "storage/latch.h"
++#include "utils/wait_event.h"
+ #include "utils/timestamp.h"
+ 
+ #include "access/printtup.h"
+@@ -119,6 +121,7 @@ typedef struct
+ #endif
+ 
+ static int	SecureOpenServer(Port *port);
++static int	PeekFirstByte(Port *port);
+ static void SendGSSAuthError(int severity, const char *errmsg, OM_uint32 maj_stat,
+ 							 OM_uint32 min_stat);
+ static void SendGSSAuthResponse(Port *port, char *extradata, uint16_t extralen);
+@@ -499,6 +502,19 @@ SetPreLoginResponseVal(Port *port, uint8_t token, StringInfo val,
+ 			break;
+ 		case TDS_PRELOGIN_ENCRYPTION:
+ 
++			/*
++			 * TDS 8.0 strict: the connection is already encrypted, so the
++			 * option means nothing.  Answer ENCRYPT_NOT_SUP, which keeps the
++			 * login from starting a second TLS handshake.
++			 */
++			if (TdsStrictHandshake)
++			{
++				appendStringInfoChar(val, TDS_ENCRYPT_NOT_SUP);
++				*loadEncryption = TDS_ENCRYPT_NOT_SUP;
++				MyTdsEncryptOption = TDS_ENCRYPT_ON;
++				break;
++			}
++
+ 			/*
+ 			 * Support full encryption if server supports & client has
+ 			 * requested ENCRYPT_ON or ENCRYPT_REQ, or Login7 request
+@@ -714,6 +730,13 @@ ValidateLoginRequest(LoginRequest request)
+ 	/* Use the GUC's values, if set. */
+ 	if (tds_default_protocol_version > 0)
+ 		request->tdsVersion = tds_default_protocol_version;
++	/*
++	 * TDS 8.0 (strict, TLS-first) LOGIN7 carries 0x08000000. The packet
++	 * format is TDS 7.4's, so treat it as 7.4 everywhere (LOGINACK too, as
++	 * SQL Server does).
++	 */
++	if (request->tdsVersion == 0x08000000 && TdsStrictHandshake)
++		request->tdsVersion = TDS_VERSION_7_4;
+ 	version = request->tdsVersion;
+ 
+ 	/* TDS Version must be valid */
+@@ -1997,6 +2020,36 @@ SecureOpenServer(Port *port)
+ 	return r;
+ }
+ 
++/*
++ * PeekFirstByte - the connection's first byte, left in the socket.
++ * Returns -1 on EOF or error.
++ */
++static int
++PeekFirstByte(Port *port)
++{
++	unsigned char b;
++
++	for (;;)
++	{
++		ssize_t		n = recv(port->sock, &b, 1, MSG_PEEK);
++
++		if (n == 1)
++			return b;
++		if (n == 0)
++			return -1;
++		if (errno == EINTR)
++			continue;
++		if (errno != EAGAIN && errno != EWOULDBLOCK)
++			return -1;
++
++		(void) WaitLatchOrSocket(MyLatch,
++								 WL_SOCKET_READABLE | WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
++								 port->sock, -1, WAIT_EVENT_CLIENT_READ);
++		ResetLatch(MyLatch);
++		CHECK_FOR_INTERRUPTS();
++	}
++}
++
+ /*
+  * : Process a TDS login handshake
+  */
+@@ -2010,6 +2063,45 @@ TdsProcessLogin(Port *port, bool loadedSsl)
+ 	TdsErrorContext->phase = 0;
+ 	TdsErrorContext->reqType = TDS_LOGIN7;
+ 
++	/*
++	 * TDS 8.0 strict encryption: a TLS handshake record (0x16) instead of a
++	 * PRELOGIN packet (0x12) as the first byte.  Do the handshake now, on the
++	 * raw socket; PRELOGIN and LOGIN7 then arrive inside TLS.  Errors here go
++	 * only to the server log: the client can read neither TDS nor plaintext.
++	 */
++	TdsStrictHandshake = false;
++	if (port->laddr.addr.ss_family != AF_UNIX)
++	{
++		int			first = PeekFirstByte(port);
++
++		if (first < 0)
++			return -1;
++		if (first == 0x16)
++		{
++			if (!loadedSsl)
++			{
++				ereport(COMMERROR,
++						(errcode(ERRCODE_PROTOCOL_VIOLATION),
++						 errmsg("TDS 8.0 strict connection refused: SSL is not enabled"),
++						 errhint("Set ssl = on and ssl_cert_file/ssl_key_file.")));
++				return -1;
++			}
++			TdsStrictHandshake = true;
++			TdsErrorContext->err_text = "TDS 8.0 strict TLS handshake";
++			rc = SecureOpenServer(port);
++			if (rc < 0)
++				return rc;
++		}
++		else if (tds_ssl_strict_only)
++		{
++			ereport(COMMERROR,
++					(errcode(ERRCODE_PROTOCOL_VIOLATION),
++					 errmsg("connection refused: babelfishpg_tds.tds_ssl_strict_only is on and the client did not use TDS 8.0 strict encryption"),
++					 errhint("Connect with Encrypt=Strict.")));
++			return -1;
++		}
++	}
++
+ 	PG_TRY();
+ 	{
+ 		TdsErrorContext->err_text = "Parsing PreLogin Request";
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdssecure.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdssecure.c
+@@ -40,6 +40,8 @@
+ 
+ int			tds_ssl_min_protocol_version = PG_TLS1_VERSION;
+ int			tds_ssl_max_protocol_version = PG_TLS1_2_VERSION;
++bool		TdsStrictHandshake = false;
++
+ #ifdef USE_SSL
+ 
+ /*
+@@ -313,6 +315,19 @@ TdsBioSecureSocket(BIO_METHOD * my_bio_methods)
+ 		my_bio_methods->bwrite = SslHandShakeWrite;
+ #endif
+ 	}
++
++	/*
++	 * TDS 8.0 strict: the TLS handshake is not wrapped in PRELOGIN packets,
++	 * so read and write the socket directly.
++	 */
++#ifdef HAVE_BIO_METH_NEW
++	if (!BIO_meth_set_read(my_bio_methods, TdsStrictHandshake ? SslRead : SslHandShakeRead) ||
++		!BIO_meth_set_write(my_bio_methods, TdsStrictHandshake ? SslWrite : SslHandShakeWrite))
++		return NULL;
++#else
++	my_bio_methods->bread = TdsStrictHandshake ? SslRead : SslHandShakeRead;
++	my_bio_methods->bwrite = TdsStrictHandshake ? SslWrite : SslHandShakeWrite;
++#endif
+ 	return my_bio_methods;
+ }
+ #endif
+--- a/contrib/babelfishpg_tds/src/include/guc.h
++++ b/contrib/babelfishpg_tds/src/include/guc.h
+@@ -20,6 +20,7 @@ extern char *product_version;
+ extern int	pe_unix_socket_permissions;
+ extern char *pe_unix_socket_group;
+ extern bool tds_ssl_encrypt;
++extern bool tds_ssl_strict_only;
+ extern int	tds_default_numeric_precision;
+ extern int	tds_default_numeric_scale;
+ extern int32_t tds_default_protocol_version;
+--- a/contrib/babelfishpg_tds/src/include/tds_secure.h
++++ b/contrib/babelfishpg_tds/src/include/tds_secure.h
+@@ -53,3 +53,10 @@ ssize_t
+ 
+ /* function defined in tdssecure.c and called from tdslogin.c */
+ void		TdsFreeSslStruct(Port *port);
++
++/*
++ * TDS 8.0 strict encryption: true when the client opened the connection with
++ * a TLS handshake (TLS-first) instead of a PRELOGIN packet.  The handshake
++ * then runs on the raw socket, and PRELOGIN/LOGIN7 travel inside TLS.
++ */
++extern bool TdsStrictHandshake;
