@@ -1,0 +1,102 @@
+--- a/contrib/babelfishpg_tsql/src/pltsql_bulkcopy.c
++++ b/contrib/babelfishpg_tsql/src/pltsql_bulkcopy.c
+@@ -28,8 +28,10 @@
+ #include "executor/executor.h"
+ #include "executor/nodeModifyTable.h"
+ #include "executor/tuptable.h"
++#include "nodes/makefuncs.h"
+ #include "optimizer/optimizer.h"
+ #include "miscadmin.h"
++#include "parser/parse_coerce.h"
+ #include "parser/parse_relation.h"
+ #include "pltsql_bulkcopy.h"
+ #include "rewrite/rewriteHandler.h"
+@@ -725,6 +727,20 @@
+ 					{
+ 						myslot->tts_values[col_index_to_insert] = Values[col_index_to_fetch];
+ 
++						/*
++						 * Length coercion to the column's char(n)/varchar(n)/nchar(n)/
++						 * nvarchar(n), as INSERT does: pads char(n) and counts n in
++						 * the column's code page. Without it a char(n) value kept its
++						 * received length and could not be sent back to clients.
++						 */
++						if (cstate->typmodfns[col_index_to_insert])
++							myslot->tts_values[col_index_to_insert] =
++								FunctionCall3Coll(cstate->typmodfns[col_index_to_insert],
++												  TupleDescAttr(myslot->tts_tupleDescriptor, col_index_to_insert)->attcollation,
++												  myslot->tts_values[col_index_to_insert],
++												  Int32GetDatum(cstate->typmods[col_index_to_insert]),
++												  BoolGetDatum(false));
++
+ 						/* In case of identity column, store the updated identity sequence value. */
+ 						if (cstate->seq_index == i)
+ 						{
+@@ -912,6 +928,8 @@
+ 	 */
+ 	defmap = (int *) palloc(num_phys_attrs * sizeof(int));
+ 	defexprs = (ExprState **) palloc(num_phys_attrs * sizeof(ExprState *));
++	cstate->typmodfns = (FmgrInfo **) palloc0(num_phys_attrs * sizeof(FmgrInfo *));
++	cstate->typmods = (int32 *) palloc0(num_phys_attrs * sizeof(int32));
+ 
+ 	for (attnum = 1; attnum <= num_phys_attrs; attnum++)
+ 	{
+@@ -921,6 +939,44 @@
+ 		if (att->attisdropped)
+ 			continue;
+ 
++		/*
++		 * String column with a length (nchar/nvarchar are domains, a UDT may
++		 * carry the length itself): look up its length coercion function as
++		 * INSERT does. The varchar/bpchar functions read the target type
++		 * (nchar/nvarchar or not) and collation from fn_expr, so give them a
++		 * FuncExpr like the one INSERT builds.
++		 */
++		{
++			int32		typmod = att->atttypmod;
++			Oid			basetype;
++			Oid			funcid;
++			char		category;
++			bool		preferred;
++			CoercionPathType path;
++
++			if (typmod >= 0)
++				basetype = getBaseType(att->atttypid);
++			else
++				basetype = getBaseTypeAndTypmod(att->atttypid, &typmod);
++			get_type_category_preferred(basetype, &category, &preferred);
++			path = find_typmod_coercion_function(att->atttypid, &funcid);
++			if (path != COERCION_PATH_FUNC)
++				path = find_typmod_coercion_function(basetype, &funcid);
++			if (typmod >= 0 && category == TYPCATEGORY_STRING && path == COERCION_PATH_FUNC)
++			{
++				FuncExpr   *fexpr = makeFuncExpr(funcid, att->atttypid,
++												 list_make3(makeNullConst(att->atttypid, typmod, att->attcollation),
++															makeConst(INT4OID, -1, InvalidOid, sizeof(int32), Int32GetDatum(typmod), false, true),
++															makeBoolConst(false, false)),
++												 InvalidOid, att->attcollation, COERCE_IMPLICIT_CAST);
++
++				cstate->typmodfns[attnum - 1] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
++				fmgr_info(funcid, cstate->typmodfns[attnum - 1]);
++				fmgr_info_set_expr((Node *) fexpr, cstate->typmodfns[attnum - 1]);
++				cstate->typmods[attnum - 1] = typmod;
++			}
++		}
++
+ 		/* Save the index for the identity column */
+ 		if (att->attidentity)
+ 		{
+--- a/contrib/babelfishpg_tsql/src/pltsql_bulkcopy.h
++++ b/contrib/babelfishpg_tsql/src/pltsql_bulkcopy.h
+@@ -53,6 +53,11 @@
+ 	int64		identity_col_incr_value;	/* increment value of identity column */
+ 	int			rv_index;		/* index for a rowversion datatype column */
+ 	List	   *rteperminfos;	/* single element list of RTEPermissionInfo */
++	FmgrInfo  **typmodfns;		/* per attribute: length coercion of a
++								 * char/varchar/nchar/nvarchar(n) column, or
++								 * NULL (okna/babelfishpg patch:
++								 * bulk-varchar-encoding) */
++	int32	   *typmods;		/* per attribute: typmod for typmodfns */
+ } BulkCopyStateData;
+ 
+ /* ----------------------
