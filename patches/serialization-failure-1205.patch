@@ -1,0 +1,14 @@
+--- a/contrib/babelfishpg_tds/error_mapping.txt	2026-11-26 20:10:49.813702000 +0100
++++ b/contrib/babelfishpg_tds/error_mapping.txt	2026-11-26 20:10:50.284316000 +0100
+@@ -93,6 +93,11 @@
+ 3D000 ERRCODE_UNDEFINED_DATABASE	"database \"%s\" does not exist" SQL_ERROR_911	16
+ 22008 ERRCODE_DATETIME_VALUE_OUT_OF_RANGE	"data out of range for datetime" SQL_ERROR_517 16
+ 40P01 ERRCODE_T_R_DEADLOCK_DETECTED	"deadlock detected" SQL_ERROR_1205 13
++# serialization failures (SERIALIZABLE / REPEATABLE READ mapped to pg_isolation) reach the client as a deadlock
++# victim, as SQL Server reports the same conflict, so existing 1205 retry logic handles them
++40001 ERRCODE_T_R_SERIALIZATION_FAILURE	"could not serialize access due to read/write dependencies among transactions"	SQL_ERROR_1205	13
++40001 ERRCODE_T_R_SERIALIZATION_FAILURE	"could not serialize access due to concurrent update"	SQL_ERROR_1205	13
++40001 ERRCODE_T_R_SERIALIZATION_FAILURE	"could not serialize access due to concurrent delete"	SQL_ERROR_1205	13
+ 22012 ERRCODE_DIVISION_BY_ZERO	"division by zero"	SQL_ERROR_8134	16
+ 0A000 ERRCODE_FEATURE_NOT_SUPPORTED	"Do not support BREAK outside of a WHILE loop, line %d"	SQL_ERROR_135 15
+ 0A000 ERRCODE_FEATURE_NOT_SUPPORTED	"Do not support CONTINUE outside of a WHILE loop, line %d" SQL_ERROR_136 15
