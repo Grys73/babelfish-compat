@@ -176,8 +176,13 @@ Applied with `patch -p1` on top of the tags, in name order; a failing hunk stops
 
 None of these is `SECURITY DEFINER`.
 
-On an existing data volume, run `init.sql` by hand with `psql -d babelfishdb` and set the
-language with `ALTER SYSTEM SET babelfishpg_tsql.language = '...'` + `select pg_reload_conf()`.
+On an existing data volume (a new image on the old volume), `start.sh` applies `init.sql` by itself when it
+differs from the one applied last: the SHA-256 of the applied file is kept in `<data>/init.sql.sha256`. It
+runs in one transaction with Postgres TCP closed, before the server starts for clients. If it fails, nothing
+changes, the container log says `start.sh: WARNING init.sql failed`, the server starts with the old objects,
+and the next start tries again. Volumes made before this have no hash file, so the first start of a new image
+applies `init.sql` once. The session language is not part of it: set it with
+`ALTER SYSTEM SET babelfishpg_tsql.language = '...'` + `select pg_reload_conf()`.
 
 ## Security notes
 

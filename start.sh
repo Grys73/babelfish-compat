@@ -102,8 +102,28 @@ if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
 
 	# Compatibility functions, see init.sql
 	./psql -d ${DATABASE} -v ON_ERROR_STOP=1 -f /init.sql
+	sha256sum /init.sql | cut -d' ' -f1 > ${BABELFISH_DATA}/init.sql.sha256
 
 	./pg_ctl -D ${BABELFISH_DATA}/ stop
+fi
+
+# A new image on an existing data volume: the block above does not run, so apply this image's init.sql
+# when it differs from the one applied last (hash in the data directory). init.sql is rerunnable; it runs in
+# one transaction, so a failure leaves the previous objects as they were and the server still starts.
+INIT_WANT=$(sha256sum /init.sql | cut -d' ' -f1)
+INIT_HAVE=$(cat ${BABELFISH_DATA}/init.sql.sha256 2>/dev/null)
+if [ "${INIT_WANT}" != "${INIT_HAVE}" ]; then
+	echo "start.sh: init.sql changed (${INIT_HAVE:-never recorded} -> ${INIT_WANT}), applying it" >&2
+	# Postgres TCP closed while init.sql runs (local socket only)
+	./pg_ctl -D ${BABELFISH_DATA}/ -w -o "-c listen_addresses=''" start
+	INIT_DB=$(./psql -d postgres -At -c "SHOW babelfishpg_tsql.database_name" 2>/dev/null)
+	if ./psql -d "${INIT_DB:-${DATABASE}}" -v ON_ERROR_STOP=1 -q --single-transaction -f /init.sql; then
+		echo "${INIT_WANT}" > ${BABELFISH_DATA}/init.sql.sha256
+		echo "start.sh: init.sql applied to ${INIT_DB:-${DATABASE}}" >&2
+	else
+		echo "start.sh: WARNING init.sql failed on ${INIT_DB:-${DATABASE}}; nothing changed, retried on the next start" >&2
+	fi
+	./pg_ctl -D ${BABELFISH_DATA}/ -w stop
 fi
 
 # Start postgres engine
