@@ -46,9 +46,12 @@ if [ ! -f ${BABELFISH_DATA}/postgresql.conf ]; then
 		babelfishpg_tds.listen_addresses = '*'  
 		babelfishpg_tsql.migration_mode = '${MIGRATION_MODE}'
 		# Compatibility: default session language (language-default.patch),
-		# REPEATABLE READ mapped to Postgres isolation, unsupported options ignored, not rejected
+		# REPEATABLE READ and SERIALIZABLE mapped to Postgres isolation, unsupported options ignored, not rejected.
+		# Postgres SERIALIZABLE does not block like SQL Server's: a conflicting transaction fails with
+		# SQLSTATE 40001 (could not serialize access) and has to be retried.
 		babelfishpg_tsql.language = '${LANGUAGE}'
 		babelfishpg_tsql.isolation_level_repeatable_read = 'pg_isolation'
+		babelfishpg_tsql.isolation_level_serializable = 'pg_isolation'
 		babelfishpg_tsql.escape_hatch_checkpoint = 'ignore'
 		babelfishpg_tsql.escape_hatch_constraint_name_for_default = 'ignore'
 		babelfishpg_tsql.escape_hatch_database_misc_options = 'ignore'

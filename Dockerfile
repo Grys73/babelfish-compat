@@ -122,12 +122,22 @@ ENV BABELFISH_HOME=/opt/babelfish
 ENV POSTGRES_USER_HOME=/var/lib/babelfish
 EXPOSE 1433 5432
 ENTRYPOINT [ "/start.sh" ]
+# Postgres fast shutdown: SIGTERM is "smart" and waits for every client (pooled idle connections never go),
+# so docker stop would end in SIGKILL and crash recovery
+STOPSIGNAL SIGINT
+
+# OS locales for FORMAT(value, format, culture): Babelfish sets lc_time / lc_numeric to <culture>.UTF-8,
+# which fails with 'invalid value for parameter "lc_time"' when the locale is not installed
+ARG LOCALES="en_US en_GB pl_PL ru_RU uk_UA be_BY de_DE de_AT de_CH cs_CZ sk_SK hu_HU ro_RO bg_BG hr_HR sl_SI sr_RS \
+	lt_LT lv_LV et_EE fi_FI sv_SE da_DK nb_NO nl_NL nl_BE fr_FR fr_BE it_IT es_ES pt_PT pt_BR el_GR tr_TR kk_KZ"
 
 # Install runtime dependencies
 RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt update && apt install -y --no-install-recommends\
 	libssl3 openssl libldap-2.5-0 libxml2 libpam0g uuid libossp-uuid16\
-	libxslt1.1 libicu70 libpq5 unixodbc
+	libxslt1.1 libicu70 libpq5 unixodbc locales && \
+	for l in ${LOCALES}; do echo "$l.UTF-8 UTF-8" >> /etc/locale.gen; done && locale-gen && \
+	rm -rf /var/lib/apt/lists/*
 
 RUN adduser postgres --home ${POSTGRES_USER_HOME}
 
